@@ -24,7 +24,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from tenacity import (
     retry,
@@ -75,6 +74,7 @@ class TraceContext:
         session_id: Optional[UUID] = None,
         agent_version: Optional[str] = None,
         environment: Optional[str] = None,
+        project_name: Optional[str] = None,
     ):
         """Initialise a new :class:`TraceContext` for one agent execution.
 
@@ -99,10 +99,10 @@ class TraceContext:
         self.agent_name = agent_name
         self.agent_version = agent_version
         self.environment = environment or "production"
+        self.project_name: Optional[str] = project_name
         
         self.started_at = datetime.now(timezone.utc)
         self.ended_at: Optional[datetime] = None
-        self.queue_time_ms: Optional[int] = None
         
         self.status = ObservabilityExecutionStatus.SUCCESS
         self.error_class: Optional[str] = None
@@ -456,7 +456,7 @@ class TraceContext:
     def _get_model_rates(model: str):
         """Return (input_$/1k, output_$/1k) for a model name string."""
         try:
-            from observability.config import settings
+            from config import settings
             for llm_cfg in (settings.LLM_MODELS or []):
                 name = (llm_cfg.get("model_name") or "").lower()
                 if name and name in model or model in name:
@@ -546,9 +546,6 @@ class TraceContext:
         if self.ended_at:
             total_latency_ms = int((self.ended_at - self.started_at).total_seconds() * 1000)
 
-        # Preserve null when queue time was not measured — null is semantically correct
-        # (honest "not instrumented") and distinct from a genuine 0 (measured zero wait).
-        queue_time_ms = self.queue_time_ms  # may be None, int >= 0
         user_query = _truncate_text(self.user_query or f"{self.agent_name} execution", 450)
         agent_response = _truncate_text(self.agent_response or f"status={self.status.value}", 450)
 
@@ -591,11 +588,11 @@ class TraceContext:
             'session_id': self.session_id,
             'agent_name': self.agent_name,
             'agent_version': self.agent_version,
+            'project_name': self.project_name,
             'environment': self.environment,
             'started_at': self.started_at,
             'ended_at': self.ended_at,
             'total_latency_ms': total_latency_ms,
-            'queue_time_ms': queue_time_ms,
             'status': self.status,
             'error_class': error_class,
             'error_message': error_message,
@@ -671,11 +668,11 @@ class ObservabilityService:
                 session_id=trace_dict['session_id'],
                 agent_name=trace_dict['agent_name'],
                 agent_version=trace_dict.get('agent_version'),
+                project_name=trace_dict.get('project_name'),
                 environment=trace_dict.get('environment'),
                 started_at=trace_dict['started_at'],
                 ended_at=trace_dict.get('ended_at'),
                 total_latency_ms=trace_dict.get('total_latency_ms'),
-                queue_time_ms=trace_dict.get('queue_time_ms'),
                 status=trace_dict['status'],
                 error_class=trace_dict.get('error_class'),
                 error_message=trace_dict.get('error_message'),
@@ -693,10 +690,7 @@ class ObservabilityService:
             session.add(trace)
             await session.commit()
             
-            logger.info(
-                f"Observability trace persisted: agent_execution_id={trace_context.agent_execution_id}, "
-                f"agent={trace_context.agent_name}, status={trace_context.status.value}"
-            )
+            logger.info("Observability trace persisted")
 
             return True
             

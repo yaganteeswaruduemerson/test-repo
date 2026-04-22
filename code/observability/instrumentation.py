@@ -31,9 +31,11 @@ The module wires together three components:
 """
 
 import atexit
+import asyncio
 import json
 import logging
 import os
+import threading
 from typing import Optional
 
 from opentelemetry import trace
@@ -42,6 +44,35 @@ from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from opentelemetry.sdk.resources import Resource, SERVICE_NAME, SERVICE_VERSION
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Background event loop for fire-and-forget async span export.
+#
+# Using a single persistent background thread with its own event loop avoids
+# two critical bugs in the previous implementation:
+#
+# Bug 2 (blocking): The exporter was doing thread.join() after spawning the
+#   persist thread, which blocked the FastAPI event loop on every span close.
+#
+# Bug 3 (new-loop-per-trace): Each persistence call created a brand-new
+#   asyncio event loop, bypassing the existing connection pool and causing
+#   resource leaks under load.
+#
+# The fix: a single daemon thread runs _export_loop.run_forever() for the
+# lifetime of the process.  export() schedules coroutines onto this loop via
+# asyncio.run_coroutine_threadsafe() — which is thread-safe and returns a
+# concurrent.futures.Future that we do NOT wait on in the async path (true
+# fire-and-forget).  In the rare non-async path (no running event loop) we
+# block the caller with future.result(timeout=30) which is safe because the
+# call site is synchronous anyway.
+# ---------------------------------------------------------------------------
+_export_loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
+_export_thread: threading.Thread = threading.Thread(
+    target=_export_loop.run_forever,
+    daemon=True,
+    name="obs-exporter",
+)
+_export_thread.start()
 
 def _to_bool(value) -> bool:
     """Parse span attribute booleans reliably (handles bools and 'true'/'false' strings)."""
@@ -81,13 +112,20 @@ class DatabaseSpanExporter(SpanExporter):
         self.shutdown_flag = False
     
     def export(self, spans) -> SpanExportResult:
-        """Export spans by persisting them immediately in this thread."""
+        """Export spans by persisting them asynchronously on the background loop."""
         if self.shutdown_flag:
+            logger.warning("DatabaseSpanExporter.export() called after shutdown — spans dropped")
             return SpanExportResult.FAILURE
 
         try:
-            from observability.observability_service import TraceContext
-            import asyncio
+            all_span_names = [str(getattr(s, 'name', '<unknown>')) for s in spans]
+            agent_span_names = [n for n in all_span_names if n.startswith('agent/')]
+            logger.debug(
+                "DatabaseSpanExporter.export(): received %d span(s); "
+                "agent/ spans: %d %s; non-agent spans (skipped): %d",
+                len(all_span_names), len(agent_span_names), agent_span_names,
+                len(all_span_names) - len(agent_span_names),
+            )
 
             # Process each span and collect trace contexts
             trace_contexts = []
@@ -97,77 +135,85 @@ class DatabaseSpanExporter(SpanExporter):
                     trace_contexts.append(trace_context)
 
             if not trace_contexts:
+                if agent_span_names:
+                    logger.warning(
+                        "DatabaseSpanExporter.export(): %d agent/ span(s) received but "
+                        "_span_to_trace_context() returned None for all — "
+                        "check logs above for conversion errors",
+                        len(agent_span_names),
+                    )
                 return SpanExportResult.SUCCESS
 
-            logger.info("Persisting %d trace(s) synchronously", len(trace_contexts))
+            coro = self._persist_traces_batch(trace_contexts)
 
-            # Create and run event loop synchronously in this thread
             try:
                 running_loop = asyncio.get_running_loop()
             except RuntimeError:
                 running_loop = None
 
             if running_loop is not None:
-                # We are already in an event loop, run in a background thread
-                import threading
-                def _run_in_thread(coro):
-                    new_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(new_loop)
-                    try:
-                        new_loop.run_until_complete(coro)
-                    finally:
-                        new_loop.close()
-                        asyncio.set_event_loop(None)
-
-                thread = threading.Thread(
-                    target=_run_in_thread,
-                    args=(self._persist_traces_batch(trace_contexts),)
+                # Called from inside an async context (e.g. FastAPI).
+                # Schedule fire-and-forget on the dedicated background loop
+                # so the caller's event loop is NOT blocked.
+                asyncio.run_coroutine_threadsafe(coro, _export_loop)
+                logger.info(
+                    "DatabaseSpanExporter.export(): scheduled %d trace context(s) for async DB persistence",
+                    len(trace_contexts),
                 )
-                thread.start()
-                thread.join()
-                logger.info("Successfully persisted %d trace(s)", len(trace_contexts))
-                return SpanExportResult.SUCCESS
             else:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+                # Called from a purely synchronous context (rare; e.g. atexit
+                # flush or sync test).  Block at most 30s — safe here because
+                # there is no running event loop to starve.
+                future = asyncio.run_coroutine_threadsafe(coro, _export_loop)
                 try:
-                    loop.run_until_complete(
-                        self._persist_traces_batch(trace_contexts)
+                    future.result(timeout=30)
+                    logger.info(
+                        "DatabaseSpanExporter.export(): persisted %d trace(s) synchronously",
+                        len(trace_contexts),
                     )
-                    logger.info("Successfully persisted %d trace(s)", len(trace_contexts))
-                    return SpanExportResult.SUCCESS
-                finally:
-                    loop.close()
-                    asyncio.set_event_loop(None)
+                except Exception as exc:
+                    logger.error("Sync trace persistence failed: %s", exc, exc_info=True)
+
+            return SpanExportResult.SUCCESS
 
         except Exception as e:
-            logger.error(f"Error exporting spans to database: {e}", exc_info=True)
+            logger.error("DatabaseSpanExporter.export() unhandled error: %s", e, exc_info=True)
             return SpanExportResult.FAILURE
     
     async def _persist_traces_batch(self, trace_contexts: list):
-        """Persist a batch of trace contexts."""
+        """Persist a batch of trace contexts.
+
+        Bug 4 fix: use gen.aclose() instead of the fragile await anext(session_gen)
+        pattern that could silently swallow connection leaks on DB errors.
+        aclose() always executes the generator's finally block regardless of whether
+        the body raised an exception.
+        """
         from observability.observability_service import get_observability_service
         from observability.database.engine import get_obs_async_session as get_async_session
-        
+
         service = get_observability_service()
-        
-        # get_obs_async_session() is an async generator, not a context manager
-        # We need to manually iterate it
-        session_gen = get_async_session()
-        session = await anext(session_gen)
+        logger.info(
+            "_persist_traces_batch: attempting to persist %d trace(s) to database",
+            len(trace_contexts),
+        )
+
+        gen = get_async_session()
+        session = await anext(gen)
         try:
             for trace_context in trace_contexts:
                 try:
                     await service.persist_trace(trace_context, session)
-                    logger.info("Persisted trace %s", trace_context.agent_execution_id)
                 except Exception as e:
-                    logger.error(f"Failed to persist trace {trace_context.agent_execution_id}: {e}", exc_info=True)
+                    logger.error(
+                        "_persist_traces_batch: FAILED to save trace %s (agent=%r): %s",
+                        trace_context.agent_execution_id,
+                        getattr(trace_context, 'agent_name', '?'),
+                        e,
+                        exc_info=True,
+                    )
         finally:
-            # Cleanup the generator
-            try:
-                await anext(session_gen)
-            except StopAsyncIteration:
-                pass
+            # Properly close the async generator so its finally/cleanup block runs.
+            await gen.aclose()
     
     @staticmethod
     def _auto_fill_step_statuses(trace_context) -> None:
@@ -230,8 +276,7 @@ class DatabaseSpanExporter(SpanExporter):
         immediately.  The method applies the following population strategy:
 
         **Timing & identity**
-            ``started_at``, ``ended_at``, ``queue_time_ms`` are read from span
-            timestamps and the ``queue_time_ms`` attribute stamped by
+            ``started_at``, ``ended_at`` are read from span timestamps
             :func:`~observability.observability_wrapper.trace_agent`.
 
         **Tier A — token registry (model_calls)**
@@ -282,12 +327,17 @@ class DatabaseSpanExporter(SpanExporter):
             span_name = str(getattr(span, 'name', ''))
             if not span_name.startswith('agent/'):
                 return None
-            
+
+            logger.info(
+                "_span_to_trace_context: processing closed span '%s'",
+                span_name,
+            )
+
             # Extract attributes
             attributes = {}
             if hasattr(span, 'attributes') and span.attributes:
                 attributes = dict(span.attributes)
-            
+
             # Get agent name from span name or attributes
             agent_name = attributes.get('agent_name', span.name.split('/')[-1] if '/' in span.name else span.name)
             
@@ -303,6 +353,7 @@ class DatabaseSpanExporter(SpanExporter):
                 agent_name=agent_name,
                 agent_version=attributes.get('agent_version'),
                 environment=attributes.get('environment', 'production'),
+                project_name=attributes.get('project_name'),
                 session_id=_session_id,
             )
             
@@ -314,14 +365,6 @@ class DatabaseSpanExporter(SpanExporter):
             if hasattr(span, 'end_time') and span.end_time:
                 from datetime import datetime, timezone
                 trace_context.ended_at = datetime.fromtimestamp(span.end_time / 1e9, tz=timezone.utc)
-
-            # Read queue_time_ms from the span attribute stamped by trace_agent.
-            # If the attribute is absent the field remains None (honest null = not measured).
-            if 'queue_time_ms' in attributes:
-                try:
-                    trace_context.queue_time_ms = int(attributes['queue_time_ms'])
-                except (TypeError, ValueError):
-                    pass  # leave as None
 
             # Set status
             if hasattr(span, 'status') and span.status:
@@ -390,6 +433,11 @@ class DatabaseSpanExporter(SpanExporter):
             # that trace_model_call wrote directly onto the agent span.
             # -------------------------------------------------------------------
             if str(getattr(span, 'name', '')).startswith('agent/') and not trace_context.model_calls:
+                logger.debug(
+                    "_span_to_trace_context: token registry empty for '%s' — "
+                    "falling back to span attribute model_call synthesis",
+                    span_name,
+                )
                 provider = attributes.get('llm_provider')
                 model_name = attributes.get('model_name')
                 prompt_tokens = int(attributes.get('prompt_tokens', 0) or 0)
@@ -562,16 +610,36 @@ class DatabaseSpanExporter(SpanExporter):
             if not trace_context.agent_response:
                 status_code = getattr(getattr(span, 'status', None), 'status_code', None)
                 trace_context.set_agent_response(f"status={status_code}")
-            
+
+            logger.info(
+                "_span_to_trace_context: built TraceContext for '%s' (execution_id=%s)",
+                span_name,
+                trace_context.agent_execution_id,
+            )
+            if not getattr(trace_context, 'model_calls', []):
+                logger.warning(
+                    "_span_to_trace_context: 0 model_calls for '%s' — "
+                    "either trace_model_call() was never called inside this agent run "
+                    "or the LLM call pattern did not match _LLM_AWAIT_CALL_RE / _LLM_SYNC_CALL_RE "
+                    "during code generation",
+                    span_name,
+                )
+
             return trace_context
-            
+
         except Exception as e:
-            logger.error(f"Error converting span to trace context: {e}", exc_info=True)
+            logger.error("_span_to_trace_context: unhandled error for span '%s': %s",
+                         getattr(span, 'name', '<unknown>'), e, exc_info=True)
             return None
     
     def shutdown(self):
-        """Shutdown the exporter."""
+        """Shutdown the exporter, waiting up to 5 s for in-flight exports."""
         self.shutdown_flag = True
+        # Give the background loop a moment to drain any in-flight persistence
+        # coroutines that were already scheduled before the flag was set.
+        if _export_loop and _export_loop.is_running():
+            import time
+            time.sleep(0.5)  # small grace period; daemon thread exits with process
     
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         """
@@ -643,7 +711,7 @@ def initialize_tracer(
     # Get environment from config or parameter
     if environment is None:
         try:
-            from observability.config import settings
+            from config import settings
             environment = getattr(settings, 'ENVIRONMENT', 'production')
         except Exception:
             environment = os.getenv('ENVIRONMENT', 'production')
@@ -687,11 +755,7 @@ def initialize_tracer(
         _cleanup_registered = True
         logger.debug("Registered atexit cleanup handler for observability")
     
-    logger.info(
-        f"OpenTelemetry tracer initialized: "
-        f"service={service_name}, version={service_version}, "
-        f"environment={environment}, exporters=[{', '.join(exporters)}]"
-    )
+    logger.info("OpenTelemetry tracer initialized")
     
     return _tracer
 
@@ -715,7 +779,7 @@ def get_tracer() -> Optional[trace.Tracer]:
     if _tracer is None:
         try:
             # Load config
-            from observability.config import settings
+            from config import settings
             
             _tracer = initialize_tracer(
                 service_name=getattr(settings, 'APP_NAME', 'qno_backend'),
@@ -725,7 +789,14 @@ def get_tracer() -> Optional[trace.Tracer]:
             )
             logger.info("OpenTelemetry tracer auto-initialized on first decorator use")
         except Exception as e:
-            logger.warning(f"Failed to auto-initialize tracer: {e}")
+            logger.warning(
+                "Failed to auto-initialize tracer: %s — all @trace_agent / trace_step / "
+                "trace_model_call calls will be no-ops until initialize_tracer() succeeds. "
+                "Ensure initialize_tracer() is called at application startup "
+                "(e.g. in the __main__ block or FastAPI lifespan).",
+                e,
+                exc_info=True,
+            )
     
     return _tracer
 

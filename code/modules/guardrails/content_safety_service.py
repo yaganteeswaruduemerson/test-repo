@@ -28,6 +28,19 @@ class ContentSafetyService:
             "content_safety_key",
             os.getenv("AZURE_CONTENT_SAFETY_KEY", ""),
         )
+
+        # Fall back to Config class attrs (injected at build time / loaded from vault at startup)
+        if not self.endpoint or not self.key:
+            try:
+                import config as _cfg_module  # noqa: PLC0415
+                _Config = getattr(_cfg_module, "Config", None)
+                if _Config:
+                    if not self.endpoint:
+                        self.endpoint = getattr(_Config, "AZURE_CONTENT_SAFETY_ENDPOINT", "") or ""
+                    if not self.key:
+                        self.key = getattr(_Config, "AZURE_CONTENT_SAFETY_KEY", "") or ""
+            except Exception:
+                pass
         self.severity_threshold = self._to_int(
             self._config.get("content_safety_severity_threshold", os.getenv("CONTENT_SAFETY_SEVERITY_THRESHOLD", 2)),
             2,
@@ -35,16 +48,23 @@ class ContentSafetyService:
 
         self._client = None
         if self.enabled:
-            try:
-                from azure.ai.contentsafety import ContentSafetyClient
-                from azure.core.credentials import AzureKeyCredential
+            if not self.endpoint or not self.endpoint.startswith("http"):
+                logger.debug("Content Safety skipped: endpoint not configured")
+                self.enabled = False
+            elif not self.key:
+                logger.debug("Content Safety skipped: API key not configured")
+                self.enabled = False
+            else:
+                try:
+                    from azure.ai.contentsafety import ContentSafetyClient
+                    from azure.core.credentials import AzureKeyCredential
 
-                self._client = ContentSafetyClient(
-                    self.endpoint,
-                    AzureKeyCredential(self.key),
-                )
-            except Exception as error:
-                logger.warning("Content Safety disabled at runtime (client init failed): %s", error)
+                    self._client = ContentSafetyClient(
+                        self.endpoint,
+                        AzureKeyCredential(self.key),
+                    )
+                except Exception as error:
+                    logger.warning("Content Safety disabled at runtime (client init failed): %s", error)
                 self.enabled = False
 
     @staticmethod

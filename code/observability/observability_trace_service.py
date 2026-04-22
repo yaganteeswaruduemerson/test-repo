@@ -1,14 +1,13 @@
 """
 Service layer for ObservabilityTrace CRUD operations.
 
-All methods are async and accept an injected AsyncSessionType (works with
-both the real AsyncSession for PostgreSQL/SQLite and AsyncSessionWrapper for
-Azure SQL).
+All methods are async and accept an injected AsyncSessionType (uses
+AsyncSessionWrapper wrapping a sync session in a thread pool for Azure SQL).
 """
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
@@ -25,12 +24,14 @@ logger = logging.getLogger(__name__)
 class TraceFilters:
     """Optional filter bag for list_and_count – keeps the method under 13 params."""
     agent_name: Optional[str] = None
+    agent_names: Optional[List[str]] = field(default=None)  # multi-agent filter (OR semantics)
     status: Optional[str] = None
     environment: Optional[str] = None
     session_id: Optional[UUID] = None
     is_evaluated: Optional[bool] = None
     started_at_from: Optional[datetime] = None
     started_at_to: Optional[datetime] = None
+    project_name: Optional[str] = None
 
 
 class ObservabilityTraceService:
@@ -92,6 +93,9 @@ class ObservabilityTraceService:
         clauses = []
         if f.agent_name is not None:
             clauses.append(ObservabilityTrace.agent_name == f.agent_name)
+        # agent_names (multi-select) uses IN — takes precedence over single agent_name when both are set
+        if f.agent_names is not None and len(f.agent_names) > 0:
+            clauses.append(ObservabilityTrace.agent_name.in_(f.agent_names))
         if f.status is not None:
             clauses.append(
                 ObservabilityTrace.status == ObservabilityExecutionStatus(f.status)
@@ -106,6 +110,8 @@ class ObservabilityTraceService:
             clauses.append(ObservabilityTrace.started_at >= f.started_at_from)
         if f.started_at_to is not None:
             clauses.append(ObservabilityTrace.started_at <= f.started_at_to)
+        if f.project_name is not None:
+            clauses.append(ObservabilityTrace.project_name == f.project_name)
         return clauses
 
     @staticmethod

@@ -1,146 +1,260 @@
 
-# config.py
-
 import os
+import logging
 from dotenv import load_dotenv
-from typing import Optional, Dict
 
-# Load environment variables from .env if present
+# Load .env file FIRST before any os.getenv() calls
 load_dotenv()
 
-class ConfigError(Exception):
-    """Custom exception for configuration errors."""
-    pass
-
 class Config:
-    """
-    Centralized configuration management for the Custom Translator File Agent.
-    Handles environment variable loading, API key management, LLM config, domain settings,
-    validation, error handling, and default values/fallbacks.
-    """
+    _kv_secrets = {}
 
-    # Required configuration keys for domain logic
-    REQUIRED_KEYS = [
-        "AZURE_BLOB_CONNECTION_STRING",
-        "AZURE_BLOB_CONTAINER_NAME",
-        "AZURE_TRANSLATOR_ENDPOINT",
-        "AZURE_TRANSLATOR_KEY",
-        "OPENAI_API_KEY"
+    # Key Vault secret mapping for this agent (subset of platform reference)
+    KEY_VAULT_SECRET_MAP = [
+        # LLM API keys
+        ("AZURE_OPENAI_API_KEY", "openai-secrets.gpt-4.1"),
+        ("AZURE_OPENAI_API_KEY", "openai-secrets.azure-key"),
+        # Azure Content Safety
+        ("AZURE_CONTENT_SAFETY_ENDPOINT", "azure-content-safety-secrets.azure_content_safety_endpoint"),
+        ("AZURE_CONTENT_SAFETY_KEY", "azure-content-safety-secrets.azure_content_safety_key"),
+        # Observability DB
+        ("OBS_AZURE_SQL_SERVER", "agentops-secrets.obs_sql_endpoint"),
+        ("OBS_AZURE_SQL_DATABASE", "agentops-secrets.obs_azure_sql_database"),
+        ("OBS_AZURE_SQL_PORT", "agentops-secrets.obs_port"),
+        ("OBS_AZURE_SQL_USERNAME", "agentops-secrets.obs_sql_username"),
+        ("OBS_AZURE_SQL_PASSWORD", "agentops-secrets.obs_sql_password"),
+        ("OBS_AZURE_SQL_SCHEMA", "agentops-secrets.obs_azure_sql_schema"),
     ]
 
-    # LLM configuration defaults
-    LLM_CONFIG_DEFAULTS = {
-        "provider": "openai",
-        "model": "gpt-4.1",
-        "temperature": 0.7,
-        "max_tokens": 2000,
-        "system_prompt": (
-            "You are a professional agent responsible for translating files stored in Azure Blob Storage. "
-            "When provided with a filename, perform the following steps: 1. Validate that the file exists in the specified Azure Blob container. "
-            "2. Generate a secure SAS URL for the file. 3. Submit the SAS URL to the Azure Translator service for translation. "
-            "4. If the translation service does not return a status 200, retry the request for up to 100 seconds. "
-            "5. Provide clear, concise, and professional updates on the process. 6. If the file is not found or translation fails after retries, "
-            "return an informative error message. Always ensure sensitive information is not exposed in responses."
-        ),
-        "user_prompt_template": (
-            "Please provide the filename of the document you wish to translate. "
-            "The agent will validate the file, generate a secure access link, and process the translation. "
-            "You will receive updates on the status and results."
-        ),
-        "few_shot_examples": [
-            "File 'report2023.docx' found. SAS URL generated. Translation in progress... Translation completed successfully.",
-            "Error: The file 'missingfile.pdf' was not found in the specified blob container. Please check the filename and try again."
-        ]
+    # For LLM kwargs logic
+    _MAX_TOKENS_UNSUPPORTED = {
+        "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.1-chat", "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o3-pro", "o4-mini"
+    }
+    _TEMPERATURE_UNSUPPORTED = {
+        "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.1-chat", "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o3-pro", "o4-mini"
     }
 
-    # Domain-specific settings
-    DOMAIN = "general"
-    AGENT_NAME = "Custom Translator File Agent"
-    PERSONALITY = "professional"
+    @classmethod
+    def _load_keyvault_secrets(cls):
+        """Load secrets from Azure Key Vault if enabled."""
+        if not getattr(cls, "USE_KEY_VAULT", False):
+            return {}
+        key_vault_uri = getattr(cls, "KEY_VAULT_URI", "")
+        if not key_vault_uri:
+            return {}
+        AZURE_USE_DEFAULT_CREDENTIAL = getattr(cls, "AZURE_USE_DEFAULT_CREDENTIAL", False)
+        try:
+            if AZURE_USE_DEFAULT_CREDENTIAL:
+                from azure.identity import DefaultAzureCredential
+                credential = DefaultAzureCredential()
+            else:
+                from azure.identity import ClientSecretCredential
+                tenant_id = os.getenv("AZURE_TENANT_ID", "")
+                client_id = os.getenv("AZURE_CLIENT_ID", "")
+                client_secret = os.getenv("AZURE_CLIENT_SECRET", "")
+                if not (tenant_id and client_id and client_secret):
+                    logging.warning("Service Principal credentials incomplete. Key Vault access will fail.")
+                    return {}
+                credential = ClientSecretCredential(
+                    tenant_id=tenant_id,
+                    client_id=client_id,
+                    client_secret=client_secret
+                )
+            from azure.keyvault.secrets import SecretClient
+            client = SecretClient(vault_url=key_vault_uri, credential=credential)
+        except Exception as e:
+            logging.warning(f"Failed to initialize Azure Key Vault client: {e}")
+            return {}
+
+        # Group refs by secret name to minimize round-trips
+        from collections import defaultdict
+        import json as _json
+        refs_by_secret = defaultdict(list)
+        for attr, ref in getattr(cls, "KEY_VAULT_SECRET_MAP", []):
+            if "." in ref:
+                secret_name, json_key = ref.split(".", 1)
+            else:
+                secret_name, json_key = ref, None
+            refs_by_secret[secret_name].append((attr, json_key))
+
+        secrets = {}
+        for secret_name, refs in refs_by_secret.items():
+            try:
+                secret = client.get_secret(secret_name)
+                if not secret or not secret.value:
+                    logging.debug(f"Key Vault: secret '{secret_name}' is empty or missing")
+                    continue
+                raw_value = secret.value.lstrip('\ufeff')
+                has_json_key = any(json_key is not None for _, json_key in refs)
+                if has_json_key:
+                    try:
+                        data = _json.loads(raw_value)
+                    except Exception:
+                        # Try to repair malformed JSON
+                        try:
+                            # Remove outer braces and split by comma
+                            inner = raw_value.strip().strip('{}')
+                            result = {}
+                            for part in inner.split(","):
+                                if ':' not in part:
+                                    continue
+                                k, v = part.split(':', 1)
+                                k = k.strip().strip('"')
+                                v = v.strip().strip('"')
+                                if k:
+                                    result[k] = v
+                            data = result
+                        except Exception:
+                            logging.debug(f"Key Vault: secret '{secret_name}' could not be parsed as JSON")
+                            continue
+                    if not isinstance(data, dict):
+                        logging.debug(f"Key Vault: secret '{secret_name}' value is not a JSON object")
+                        continue
+                    for attr, json_key in refs:
+                        if json_key is not None:
+                            val = data.get(json_key)
+                            if attr in secrets:
+                                continue
+                            if val is not None and val != "":
+                                secrets[attr] = str(val)
+                else:
+                    for attr, json_key in refs:
+                        if json_key is None and raw_value:
+                            secrets[attr] = raw_value
+                            break
+            except Exception as exc:
+                logging.debug(f"Key Vault: failed to fetch secret '{secret_name}': {exc}")
+                continue
+        cls._kv_secrets = secrets
+        return secrets
 
     @classmethod
-    def get(cls, key: str, required: bool = True, default: Optional[str] = None) -> Optional[str]:
-        """Get a configuration value from environment variables."""
-        value = os.getenv(key)
-        if value is None:
-            if required:
-                raise ConfigError(f"Missing required configuration: {key}")
-            return default
-        return value
+    def _validate_api_keys(cls):
+        provider = getattr(cls, "MODEL_PROVIDER", "").lower()
+        if provider == "openai":
+            if not getattr(cls, "OPENAI_API_KEY", ""):
+                raise ValueError("OPENAI_API_KEY is required for OpenAI provider")
+        elif provider == "azure":
+            if not getattr(cls, "AZURE_OPENAI_API_KEY", ""):
+                raise ValueError("AZURE_OPENAI_API_KEY is required for Azure provider")
+        elif provider == "anthropic":
+            if not getattr(cls, "ANTHROPIC_API_KEY", ""):
+                raise ValueError("ANTHROPIC_API_KEY is required for Anthropic provider")
+        elif provider == "google":
+            if not getattr(cls, "GOOGLE_API_KEY", ""):
+                raise ValueError("GOOGLE_API_KEY is required for Google provider")
+
+    @classmethod
+    def get_llm_kwargs(cls):
+        kwargs = {}
+        model_lower = (getattr(cls, "LLM_MODEL", "") or "").lower()
+        if not any(model_lower.startswith(m) for m in cls._TEMPERATURE_UNSUPPORTED):
+            kwargs["temperature"] = getattr(cls, "LLM_TEMPERATURE", None)
+        if any(model_lower.startswith(m) for m in cls._MAX_TOKENS_UNSUPPORTED):
+            kwargs["max_completion_tokens"] = getattr(cls, "LLM_MAX_TOKENS", None)
+        else:
+            kwargs["max_tokens"] = getattr(cls, "LLM_MAX_TOKENS", None)
+        return kwargs
 
     @classmethod
     def validate(cls):
-        """Validate that all required configuration keys are present."""
-        missing = [k for k in cls.REQUIRED_KEYS if not os.getenv(k)]
-        if missing:
-            raise ConfigError(f"Missing required configuration keys: {missing}")
+        cls._validate_api_keys()
 
-    @classmethod
-    def get_llm_config(cls) -> Dict:
-        """Return LLM configuration, using environment overrides if present."""
-        config = cls.LLM_CONFIG_DEFAULTS.copy()
-        # Allow environment variable overrides for model, temperature, max_tokens
-        config["provider"] = os.getenv("LLM_PROVIDER", config["provider"])
-        config["model"] = os.getenv("LLM_MODEL", config["model"])
-        config["temperature"] = float(os.getenv("LLM_TEMPERATURE", config["temperature"]))
-        config["max_tokens"] = int(os.getenv("LLM_MAX_TOKENS", config["max_tokens"]))
-        config["system_prompt"] = os.getenv("LLM_SYSTEM_PROMPT", config["system_prompt"])
-        return config
+def _initialize_config():
+    # Load Key Vault config from .env
+    USE_KEY_VAULT = os.getenv("USE_KEY_VAULT", "").lower() in ("true", "1", "yes")
+    KEY_VAULT_URI = os.getenv("KEY_VAULT_URI", "")
+    AZURE_USE_DEFAULT_CREDENTIAL = os.getenv("AZURE_USE_DEFAULT_CREDENTIAL", "").lower() in ("true", "1", "yes")
 
-    @classmethod
-    def get_domain_settings(cls) -> Dict:
-        """Return domain-specific settings."""
-        return {
-            "domain": cls.DOMAIN,
-            "agent_name": cls.AGENT_NAME,
-            "personality": cls.PERSONALITY
-        }
+    setattr(Config, "USE_KEY_VAULT", USE_KEY_VAULT)
+    setattr(Config, "KEY_VAULT_URI", KEY_VAULT_URI)
+    setattr(Config, "AZURE_USE_DEFAULT_CREDENTIAL", AZURE_USE_DEFAULT_CREDENTIAL)
 
-    @classmethod
-    def get_azure_blob_settings(cls) -> Dict:
-        """Return Azure Blob Storage settings."""
-        return {
-            "connection_string": cls.get("AZURE_BLOB_CONNECTION_STRING"),
-            "container_name": cls.get("AZURE_BLOB_CONTAINER_NAME")
-        }
+    # Load Key Vault secrets if enabled
+    if USE_KEY_VAULT:
+        Config._load_keyvault_secrets()
 
-    @classmethod
-    def get_azure_translator_settings(cls) -> Dict:
-        """Return Azure Translator API settings."""
-        return {
-            "endpoint": cls.get("AZURE_TRANSLATOR_ENDPOINT"),
-            "key": cls.get("AZURE_TRANSLATOR_KEY")
-        }
+    # Azure AI Search variables (always from .env, never Key Vault)
+    AZURE_SEARCH_VARS = ["AZURE_SEARCH_ENDPOINT", "AZURE_SEARCH_API_KEY", "AZURE_SEARCH_INDEX_NAME"]
+    # Service Principal vars (skip if using DefaultAzureCredential)
+    AZURE_SP_VARS = ["AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET"]
 
-    @classmethod
-    def get_openai_api_key(cls) -> str:
-        """Return OpenAI API key, raise error if missing."""
-        key = cls.get("OPENAI_API_KEY")
-        if not key:
-            raise ConfigError("OPENAI_API_KEY is required for LLM operations.")
-        return key
+    # All config variables required by agent and platform
+    CONFIG_VARIABLES = [
+        # General
+        "ENVIRONMENT",
+        # Azure Key Vault config (already loaded above)
+        # Azure Service Principal (conditionally loaded)
+        "AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET",
+        # LLM / Model
+        "MODEL_PROVIDER", "LLM_MODEL", "LLM_TEMPERATURE", "LLM_MAX_TOKENS",
+        "AZURE_OPENAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY",
+        "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_EMBEDDING_DEPLOYMENT",
+        # Azure Content Safety
+        "AZURE_CONTENT_SAFETY_ENDPOINT", "AZURE_CONTENT_SAFETY_KEY",
+        "CONTENT_SAFETY_ENABLED", "CONTENT_SAFETY_SEVERITY_THRESHOLD",
+        # Azure AI Search (always from .env)
+        "AZURE_SEARCH_ENDPOINT", "AZURE_SEARCH_API_KEY", "AZURE_SEARCH_INDEX_NAME",
+        # Agent identity
+        "AGENT_NAME", "AGENT_ID", "PROJECT_NAME", "PROJECT_ID", "SERVICE_NAME", "SERVICE_VERSION",
+        # Observability DB
+        "OBS_DATABASE_TYPE", "OBS_AZURE_SQL_SERVER", "OBS_AZURE_SQL_DATABASE", "OBS_AZURE_SQL_PORT",
+        "OBS_AZURE_SQL_USERNAME", "OBS_AZURE_SQL_PASSWORD", "OBS_AZURE_SQL_SCHEMA",
+        "OBS_AZURE_SQL_TRUST_SERVER_CERTIFICATE",
+        # Domain-specific
+        "LLM_MODELS", "VALIDATION_CONFIG_PATH", "VERSION"
+    ]
 
-    @classmethod
-    def get_all_settings(cls) -> Dict:
-        """Return all relevant settings for debugging or diagnostics."""
-        try:
-            cls.validate()
-        except Exception as e:
-            raise ConfigError(f"Configuration validation failed: {e}")
-        return {
-            "llm_config": cls.get_llm_config(),
-            "domain_settings": cls.get_domain_settings(),
-            "azure_blob": cls.get_azure_blob_settings(),
-            "azure_translator": cls.get_azure_translator_settings(),
-            "openai_api_key_present": bool(os.getenv("OPENAI_API_KEY"))
-        }
+    for var_name in CONFIG_VARIABLES:
+        # Skip Service Principal vars if using DefaultAzureCredential
+        if var_name in AZURE_SP_VARS and AZURE_USE_DEFAULT_CREDENTIAL:
+            continue
 
-# Error handling for missing API keys or configuration
-try:
-    Config.validate()
-except ConfigError as ce:
-    # Comment out the next line if you want to suppress error on import
-    # print(f"Configuration error: {ce}")
-    raise
+        value = None
 
-# Default/fallback values are handled in get() and get_llm_config()
+        # Azure AI Search variables: always from .env
+        if var_name in AZURE_SEARCH_VARS:
+            value = os.getenv(var_name)
+        # Standard priority: Key Vault > .env
+        elif USE_KEY_VAULT and var_name in Config._kv_secrets:
+            value = Config._kv_secrets[var_name]
+        else:
+            value = os.getenv(var_name)
+
+        # Special handling for OBS_AZURE_SQL_TRUST_SERVER_CERTIFICATE
+        if var_name == "OBS_AZURE_SQL_TRUST_SERVER_CERTIFICATE":
+            if value is None or value == "":
+                value = "yes"
+        # Convert numeric values
+        elif value and var_name == "LLM_TEMPERATURE":
+            try:
+                value = float(value)
+            except ValueError:
+                logging.warning(f"Invalid float value for {var_name}: {value}")
+        elif value and var_name in ("LLM_MAX_TOKENS", "OBS_AZURE_SQL_PORT"):
+            try:
+                value = int(value)
+            except ValueError:
+                logging.warning(f"Invalid integer value for {var_name}: {value}")
+        elif var_name == "LLM_MODELS":
+            # Parse as JSON list if present
+            if value:
+                import json as _json
+                try:
+                    value = _json.loads(value)
+                except Exception:
+                    value = []
+            else:
+                value = []
+        # If not found, warn and set to "" or None
+        if value is None or value == "":
+            if var_name != "OBS_AZURE_SQL_TRUST_SERVER_CERTIFICATE":
+                logging.warning(f"Configuration variable {var_name} not found in .env file")
+                value = "" if var_name not in ("LLM_TEMPERATURE", "LLM_MAX_TOKENS", "OBS_AZURE_SQL_PORT", "LLM_MODELS") else None
+        setattr(Config, var_name, value)
+
+# Initialize config at module import
+_initialize_config()
+
+# Settings instance (backward compatibility with observability module)
+settings = Config()

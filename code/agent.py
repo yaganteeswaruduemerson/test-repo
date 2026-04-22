@@ -1,671 +1,711 @@
-try:
-    from observability.observability_wrapper import (
-        trace_agent, trace_step, trace_step_sync, trace_model_call, trace_tool_call,
-    )
-except ImportError:  # observability module not available (e.g. isolated test env)
-    from contextlib import contextmanager as _obs_cm, asynccontextmanager as _obs_acm
-    def trace_agent(*_a, **_kw):  # type: ignore[misc]
-        def _deco(fn): return fn
-        return _deco
-    class _ObsHandle:
-        output_summary = None
-        def capture(self, *a, **kw): pass
-    @_obs_acm
-    async def trace_step(*_a, **_kw):  # type: ignore[misc]
-        yield _ObsHandle()
-    @_obs_cm
-    def trace_step_sync(*_a, **_kw):  # type: ignore[misc]
-        yield _ObsHandle()
-    def trace_model_call(*_a, **_kw): pass  # type: ignore[misc]
-    def trace_tool_call(*_a, **_kw): pass  # type: ignore[misc]
+import asyncio as _asyncio
+
+import time as _time
+from observability.observability_wrapper import (
+    trace_agent, trace_step, trace_step_sync, trace_model_call, trace_tool_call,
+)
+from config import settings as _obs_settings
+
+import logging as _obs_startup_log
+from contextlib import asynccontextmanager
+from observability.instrumentation import initialize_tracer
+
+_obs_startup_logger = _obs_startup_log.getLogger(__name__)
 
 from modules.guardrails.content_safety_decorator import with_content_safety
 
-GUARDRAILS_CONFIG = {'check_credentials_output': True,
- 'check_jailbreak': True,
- 'check_output': True,
- 'check_pii_input': False,
- 'check_toxic_code_output': True,
- 'check_toxicity': True,
- 'content_safety_enabled': True,
- 'content_safety_severity_threshold': 3,
- 'runtime_enabled': True,
- 'sanitize_pii': False}
+GUARDRAILS_CONFIG = {
+    'content_safety_enabled': True,
+    'runtime_enabled': True,
+    'content_safety_severity_threshold': 3,
+    'check_toxicity': True,
+    'check_jailbreak': True,
+    'check_pii_input': False,
+    'check_credentials_output': True,
+    'check_output': True,
+    'check_toxic_code_output': True,
+    'sanitize_pii': False
+}
 
-
-import os
 import logging
-import asyncio
-import time
-from typing import Optional, Dict, Any, Callable
-from fastapi import FastAPI, Request, HTTPException, status
+import json
+from typing import List, Optional, Dict, Any
+from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, field_validator, ValidationError, Field
-from dotenv import load_dotenv
-from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
-import requests
-from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_delay, wait_exponential, RetryError
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, Field, ValidationError
+from pathlib import Path
 
-# Observability wrappers are injected by the runtime (do not import or decorate @trace_agent manually)
-# Use trace_step/trace_step_sync as instructed
+from azure.search.documents import SearchClient
+from azure.core.credentials import AzureKeyCredential
+from azure.search.documents.models import VectorizedQuery
 
-# Load environment variables from .env if present
-load_dotenv()
+import openai
+from config import Config
 
-# Logging configuration
-logger = logging.getLogger("CustomTranslatorFileAgent")
-logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-formatter = logging.Formatter(
-    "[%(asctime)s] %(levelname)s %(name)s: %(message)s"
+# =========================
+# CONSTANTS
+# =========================
+
+SYSTEM_PROMPT = (
+    "You are a planetary science information specialist. Your task is to deliver a comprehensive, scientifically accurate comparative analysis of Earth and Jupiter, focusing on their physical dimensions and spatial relationship to the Sun. For each planet, explicitly cite the equatorial diameter in both miles and kilometers, describe the scale difference (including how many Earths could fit inside Jupiter), and compare their average distances from the Sun. Ensure your response is clear, precise, and references only information from the provided knowledge base documents (Jupiter.pdf, Earth.pdf). If any requested measurement or comparison is not found in the retrieved content, inform the user and suggest consulting additional scientific resources. Format your output as a structured, professional summary suitable for educational or research purposes."
 )
-handler.setFormatter(formatter)
-if not logger.hasHandlers():
-    logger.addHandler(handler)
+OUTPUT_FORMAT = (
+    "- Structured summary with clear sections:\n"
+    "  - Physical Dimensions (diameter in miles and kilometers)\n"
+    "  - Scale Comparison (how many Earths fit inside Jupiter)\n"
+    "  - Orbital Distances (average distance from Sun in miles and kilometers)\n"
+    "  - Explanation of spatial relationship and orbital differences\n"
+    "- Cite source document(s) for each fact\n"
+    "- Use bullet points or paragraphs for clarity"
+)
+FALLBACK_RESPONSE = (
+    "The requested measurements or comparisons are not available in the provided knowledge base documents. Please consult additional scientific resources for further information."
+)
+SELECTED_DOCUMENT_TITLES = ["Jupiter.pdf", "Earth.pdf"]
+VALIDATION_CONFIG_PATH = Config.VALIDATION_CONFIG_PATH or str(Path(__file__).parent / "validation_config.json")
 
-# --- Configuration Management ---
-class Config:
-    """Centralized configuration management for Azure and LLM."""
-    @staticmethod
-    def get(key: str, required: bool = True, default: Optional[str] = None) -> Optional[str]:
-        value = os.getenv(key)
-        if value is None and required:
-            raise ValueError(f"Missing required configuration: {key}")
-        return value if value is not None else default
+# =========================
+# LOGGING CONFIG
+# =========================
 
-    @staticmethod
-    def validate(required_keys=None):
-        keys = required_keys or [
-            "AZURE_BLOB_CONNECTION_STRING",
-            "AZURE_BLOB_CONTAINER_NAME",
-            "AZURE_TRANSLATOR_ENDPOINT",
-            "AZURE_TRANSLATOR_KEY",
-            "OPENAI_API_KEY"
-        ]
-        missing = [k for k in keys if not os.getenv(k)]
-        if missing:
-            raise ValueError(f"Missing required configuration keys: {missing}")
+logger = logging.getLogger("agent")
+logger.setLevel(logging.INFO)
 
-# --- Input Model and Validation ---
-class TranslationRequest(BaseModel):
-    filename: str = Field(..., max_length=256, description="Name of the file to translate.")
+# =========================
+# INPUT/OUTPUT MODELS
+# =========================
 
-    @field_validator("filename")
-    @classmethod
-    def validate_filename(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("Filename must not be empty.")
-        if len(v) > 256:
-            raise ValueError("Filename too long (max 256 characters).")
-        if any(c in v for c in ['..', '/', '\\', ':', '*', '?', '"', '<', '>', '|']):
-            raise ValueError("Filename contains invalid characters.")
-        return v
+class AnalyzeResponse(BaseModel):
+    success: bool = Field(..., description="Whether the analysis was successful")
+    result: Optional[str] = Field(None, description="Structured comparative analysis summary")
+    error: Optional[str] = Field(None, description="Error message if any")
+    tips: Optional[str] = Field(None, description="Helpful tips for fixing input issues")
 
-# --- Logger Utility ---
-class Logger:
-    """Logs all API interactions, errors, and audit events."""
-    @with_content_safety(config=GUARDRAILS_CONFIG)
-    def log_event(self, event_type: str, message: str, context: dict):
-        try:
-            logger.info(f"[{event_type}] {message} | Context: {context}")
-        except Exception as e:
-            # Logging must not interrupt main workflow
-            pass
+# =========================
+# SANITIZER UTILITY
+# =========================
 
-# --- Error Handler ---
-class ErrorHandler:
-    """Handles error mapping, formatting, escalation, and logging."""
-    def __init__(self, logger: Logger):
-        self.logger = logger
+import re as _re
 
-    def handle_error(self, error_code: str, context: dict) -> str:
-        error_messages = {
-            "BLOB_NOT_FOUND": "The requested file could not be found in the specified Azure Blob container. Please check the filename and try again.",
-            "TRANSLATION_FAILED": "The translation service is unavailable or failed after multiple attempts. Please try again later or contact support.",
-            "CONFIG_ERROR": "A configuration error occurred. Please contact support.",
-            "VALIDATION_ERROR": "Input validation failed. Please check your request and try again.",
-            "INTERNAL_ERROR": "An unexpected error occurred. Please try again later.",
-        }
-        msg = error_messages.get(error_code, "An unknown error occurred.")
-        self.logger.log_event("error", f"{error_code}: {msg}", context)
-        return msg
+_FENCE_RE = _re.compile(r"```(?:\w+)?\s*\n(.*?)```", _re.DOTALL)
+_LONE_FENCE_START_RE = _re.compile(r"^```\w*$")
+_WRAPPER_RE = _re.compile(
+    r"^(?:"
+    r"Here(?:'s| is)(?: the)? (?:the |your |a )?(?:code|solution|implementation|result|explanation|answer)[^:]*:\s*"
+    r"|Sure[!,.]?\s*"
+    r"|Certainly[!,.]?\s*"
+    r"|Below is [^:]*:\s*"
+    r")",
+    _re.IGNORECASE,
+)
+_SIGNOFF_RE = _re.compile(
+    r"^(?:Let me know|Feel free|Hope this|This code|Note:|Happy coding|If you)",
+    _re.IGNORECASE,
+)
+_BLANK_COLLAPSE_RE = _re.compile(r"\n{3,}")
 
-# --- Azure Blob Adapter ---
-class AzureBlobAdapter:
-    """Encapsulates Azure Blob Storage SDK interactions."""
+def _strip_fences(text: str, content_type: str) -> str:
+    """Extract content from Markdown code fences."""
+    fence_matches = _FENCE_RE.findall(text)
+    if fence_matches:
+        if content_type == "code":
+            return "\n\n".join(block.strip() for block in fence_matches)
+        for match in fence_matches:
+            fenced_block = _FENCE_RE.search(text)
+            if fenced_block:
+                text = text[:fenced_block.start()] + match.strip() + text[fenced_block.end():]
+        return text
+    lines = text.splitlines()
+    if lines and _LONE_FENCE_START_RE.match(lines[0].strip()):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+def _strip_trailing_signoffs(text: str) -> str:
+    """Remove conversational sign-off lines from the end of code output."""
+    lines = text.splitlines()
+    while lines and _SIGNOFF_RE.match(lines[-1].strip()):
+        lines.pop()
+    return "\n".join(lines).rstrip()
+
+@with_content_safety(config=GUARDRAILS_CONFIG)
+def sanitize_llm_output(raw: str, content_type: str = "code") -> str:
+    """
+    Generic post-processor that cleans common LLM output artefacts.
+    Args:
+        raw: Raw text returned by the LLM.
+        content_type: 'code' | 'text' | 'markdown'.
+    Returns:
+        Cleaned string ready for validation, formatting, or direct return.
+    """
+    if not raw:
+        return ""
+    text = _strip_fences(raw.strip(), content_type)
+    text = _WRAPPER_RE.sub("", text, count=1).strip()
+    if content_type == "code":
+        text = _strip_trailing_signoffs(text)
+    return _BLANK_COLLAPSE_RE.sub("\n\n", text).strip()
+
+# =========================
+# RETRIEVAL LAYER
+# =========================
+
+class AzureAISearchClient:
+    """
+    Handles low-level communication with Azure AI Search.
+    """
     def __init__(self):
-        self._connection_string = Config.get("AZURE_BLOB_CONNECTION_STRING", required=True)
-        self._container_name = Config.get("AZURE_BLOB_CONTAINER_NAME", required=True)
         self._client = None
 
     def _get_client(self):
         if self._client is None:
-            self._client = BlobServiceClient.from_connection_string(self._connection_string)
+            endpoint = Config.AZURE_SEARCH_ENDPOINT
+            api_key = Config.AZURE_SEARCH_API_KEY
+            index_name = Config.AZURE_SEARCH_INDEX_NAME
+            if not endpoint or not api_key or not index_name:
+                raise ValueError("Azure AI Search credentials are not configured.")
+            self._client = SearchClient(
+                endpoint=endpoint,
+                index_name=index_name,
+                credential=AzureKeyCredential(api_key),
+            )
         return self._client
 
-    def file_exists(self, filename: str) -> bool:
+    @with_content_safety(config=GUARDRAILS_CONFIG)
+    def search(self, query: str, filter: Optional[str], top_k: int) -> List[Dict[str, Any]]:
+        """
+        Perform vector + keyword search with optional OData filter.
+        """
         client = self._get_client()
-        container_client = client.get_container_client(self._container_name)
-        try:
-            blob_client = container_client.get_blob_client(blob=filename)
-            return blob_client.exists()
-        except Exception as e:
-            logger.warning(f"Error checking file existence: {e}")
-            return False
-
-    def create_sas_url(self, filename: str) -> str:
-        client = self._get_client()
-        try:
-            sas_token = generate_blob_sas(
-                account_name=client.account_name,
-                container_name=self._container_name,
-                blob_name=filename,
-                account_key=client.credential.account_key,
-                permission=BlobSasPermissions(read=True),
-                expiry=time.time() + 300  # 5 minutes
-            )
-            url = f"https://{client.account_name}.blob.core.windows.net/{self._container_name}/{filename}?{sas_token}"
-            return url
-        except Exception as e:
-            logger.warning(f"Error generating SAS URL: {e}")
-            raise
-
-# --- File Validation Service ---
-class FileValidationService:
-    """Validates file existence in Azure Blob Storage."""
-    def __init__(self, blob_adapter: AzureBlobAdapter):
-        self.blob_adapter = blob_adapter
-
-    def validate_file_exists(self, filename: str) -> bool:
-        exists = self.blob_adapter.file_exists(filename)
-        if not exists:
-            logger.warning(f"File '{filename}' not found in blob storage.")
-        return exists
-
-# --- SAS URL Service ---
-class SASUrlService:
-    """Generates secure SAS URLs for files in Azure Blob Storage."""
-    def __init__(self, blob_adapter: AzureBlobAdapter):
-        self.blob_adapter = blob_adapter
-        self._cache = {}  # Simple in-memory cache for 5 minutes
-
-    def generate_sas_url(self, filename: str) -> str:
-        now = time.time()
-        # Cache SAS URLs for 5 minutes
-        if filename in self._cache:
-            cached_url, expiry = self._cache[filename]
-            if expiry > now:
-                return cached_url
-        url = self.blob_adapter.create_sas_url(filename)
-        self._cache[filename] = (url, now + 300)
-        return url
-
-# --- Azure Translator Adapter ---
-class AzureTranslatorAdapter:
-    """Encapsulates Azure Translator API calls."""
-    def __init__(self):
-        self._endpoint = Config.get("AZURE_TRANSLATOR_ENDPOINT", required=True)
-        self._key = Config.get("AZURE_TRANSLATOR_KEY", required=True)
-
-    async def submit_translation_request(self, sas_url: str) -> dict:
-        # Example: POST to Azure Translator Document API
-        url = f"{self._endpoint}/translator/text/batch/v1.0/batches"
-        headers = {
-            "Ocp-Apim-Subscription-Key": self._key,
-            "Content-Type": "application/json"
+        search_kwargs = {
+            "search_text": query,
+            "top": top_k,
+            "select": ["chunk", "title"],
         }
-        body = {
-            "inputs": [
-                {
-                    "storageSource": "AzureBlob",
-                    "source": {
-                        "sourceUrl": sas_url,
-                        "language": "auto"
-                    },
-                    "targets": [
-                        {
-                            "targetUrl": sas_url,  # For demo, use same SAS URL; in real use, provide a writable SAS URL
-                            "language": "en"
-                        }
-                    ]
-                }
-            ]
-        }
-        try:
-            loop = asyncio.get_event_loop()
-            # Use requests in thread executor for async
-            def _post():
-                _obs_t0 = _time.time()
-                resp = requests.post(url, headers=headers, json=body, timeout=30)
-                try:
-                    trace_tool_call(
-                        tool_name='requests.post',
-                        latency_ms=int((_time.time() - _obs_t0) * 1000),
-                        output=str(resp)[:200] if resp is not None else None,
-                        status="success",
-                    )
-                except Exception:
-                    pass
-                return resp
-            resp = await loop.run_in_executor(None, _post)
-            return {
-                "status_code": resp.status_code,
-                "json": resp.json() if resp.content else {},
-                "text": resp.text
-            }
-        except Exception as e:
-            logger.warning(f"Error calling Azure Translator: {e}")
-            return {
-                "status_code": 500,
-                "json": {},
-                "text": str(e)
-            }
+        if filter:
+            search_kwargs["filter"] = filter
+        # The vector query will be injected by the ChunkRetriever
+        return client.search(**search_kwargs)
 
-# --- Retry Handler ---
-class RetryHandler:
-    """Implements retry logic with exponential backoff for translation requests."""
-    async def retry(self, func: Callable, max_duration: int, *args, **kwargs) -> dict:
-        start_time = time.time()
-        last_exc = None
-        async for attempt in AsyncRetrying(
-            retry=retry_if_exception_type(Exception),
-            wait=wait_exponential(multiplier=2, min=2, max=10),
-            stop=stop_after_delay(max_duration),
-            reraise=True
-        ):
-            with attempt:
-                result = await func(*args, **kwargs)
-                if result.get("status_code") == 200:
-                    return result
-                last_exc = Exception(f"Non-200 status: {result.get('status_code')}")
-                raise last_exc
-        # If we get here, all retries failed
-        raise last_exc if last_exc else Exception("Translation failed after retries.")
-
-# --- Translation Service ---
-class TranslationService:
-    """Handles translation requests to Azure Translator, manages retry logic, and processes responses."""
-    def __init__(self, translator_adapter: AzureTranslatorAdapter, retry_handler: RetryHandler):
-        self.translator_adapter = translator_adapter
-        self.retry_handler = retry_handler
-
-    async def translate_file(self, sas_url: str) -> dict:
-        async with trace_step(
-            "translation_request", step_type="tool_call",
-            decision_summary="Submit SAS URL to Azure Translator with retry logic",
-            output_fn=lambda r: f"status_code={r.get('status_code','?')}"
-        ) as step:
-            try:
-                result = await self.retry_handler.retry(
-                    self.translator_adapter.submit_translation_request,
-                    max_duration=100,
-                    sas_url=sas_url
-                )
-                step.capture(result)
-                return result
-            except Exception as e:
-                step.capture({"status_code": 500, "error": str(e)})
-                return {"status_code": 500, "error": str(e)}
-
-# --- Status Reporter ---
-class StatusReporter:
-    """Formats and delivers status updates and final responses to users."""
-    def __init__(self, llm_client_factory: Callable[[], Any], model: str, system_prompt: str, temperature: float, max_tokens: int):
-        self.llm_client_factory = llm_client_factory
-        self.model = model
-        self.system_prompt = system_prompt
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-
-    async def report_status(self, status: str, details: dict) -> str:
-        # Compose a professional summary using LLM
-        user_message = f"Status: {status}\nDetails: {details}"
-        async with trace_step(
-            "generate_status_report", step_type="llm_call",
-            decision_summary="Call LLM to summarize translation process for user",
-            output_fn=lambda r: f"length={len(r) if r else 0}"
-        ) as step:
-            try:
-                client = self.llm_client_factory()
-                response = await client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": self.system_prompt},
-                        {"role": "user", "content": user_message}
-                    ],
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens
-                )
-                content = response.choices[0].message.content
-                step.capture(content)
-                try:
-                    trace_model_call(
-                        provider="openai",
-                        model_name=self.model,
-                        prompt_tokens=getattr(response.usage, "prompt_tokens", 0),
-                        completion_tokens=getattr(response.usage, "completion_tokens", 0),
-                        latency_ms=0,
-                        response_summary=content[:200] if content else ""
-                    )
-                except Exception:
-                    pass
-                return content
-            except Exception as e:
-                step.capture(f"LLM error: {e}")
-                logger.warning(f"LLM status reporting failed: {e}")
-                return None
-
-# --- Agent Controller ---
-class AgentController:
-    """Entry point for user requests; manages input validation, workflow orchestration, and response formatting."""
-    def __init__(
-        self,
-        file_validation_service: FileValidationService,
-        sas_url_service: SASUrlService,
-        translation_service: TranslationService,
-        status_reporter: StatusReporter,
-        error_handler: ErrorHandler
-    ):
-        self.file_validation_service = file_validation_service
-        self.sas_url_service = sas_url_service
-        self.translation_service = translation_service
-        self.status_reporter = status_reporter
-        self.error_handler = error_handler
+class ChunkRetriever:
+    """
+    Orchestrates chunk retrieval using AzureAISearchClient.
+    """
+    def __init__(self, embedding_model: Optional[str] = None):
+        self.search_client = AzureAISearchClient()
+        self.embedding_model = embedding_model or Config.AZURE_OPENAI_EMBEDDING_DEPLOYMENT or "text-embedding-ada-002"
 
     @with_content_safety(config=GUARDRAILS_CONFIG)
-    async def process_translation_request(self, filename: str) -> dict:
-        async with trace_step(
-            "process_translation_request", step_type="process",
-            decision_summary="Main workflow: validate file, generate SAS URL, submit translation, report status",
-            output_fn=lambda r: f"success={r.get('success', '?')}"
-        ) as step:
-            try:
-                # Step 1: Validate file existence
-                with trace_step_sync(
-                    "validate_file_exists", step_type="tool_call",
-                    decision_summary="Check if file exists in Azure Blob Storage",
-                    output_fn=lambda r: f"exists={r}"
-                ) as substep:
-                    exists = self.file_validation_service.validate_file_exists(filename)
-                    substep.capture(exists)
-                if not exists:
-                    msg = self.error_handler.handle_error("BLOB_NOT_FOUND", {"filename": filename})
-                    summary = await self.status_reporter.report_status("File Not Found", {"filename": filename})
-                    step.capture({"success": False, "error": msg, "summary": summary})
-                    return {
-                        "success": False,
-                        "error": msg,
-                        "summary": summary or msg
-                    }
+    async def retrieve_chunks(self, query: str, filter_titles: List[str], top_k: int) -> List[str]:
+        """
+        Retrieve relevant chunks from Azure AI Search using vector + keyword search and OData filter.
+        """
+        # Step 1: Embed the query using Azure OpenAI
+        openai_client = openai.AsyncAzureOpenAI(
+            api_key=Config.AZURE_OPENAI_API_KEY,
+            api_version="2024-02-01",
+            azure_endpoint=Config.AZURE_OPENAI_ENDPOINT,
+        )
+        _t0 = _time.time()
+        embedding_resp = await openai_client.embeddings.create(
+            input=query,
+            model=self.embedding_model,
+        )
+        try:
+            trace_tool_call(
+                tool_name="openai_client.embeddings.create",
+                latency_ms=int((_time.time() - _t0) * 1000),
+                output=str(embedding_resp)[:200] if embedding_resp else None,
+                status="success",
+            )
+        except Exception:
+            pass
 
-                # Step 2: Generate SAS URL
-                with trace_step_sync(
-                    "generate_sas_url", step_type="tool_call",
-                    decision_summary="Generate SAS URL for file",
-                    output_fn=lambda r: f"url={r[:30]}..." if r else "url=None"
-                ) as substep:
-                    try:
-                        sas_url = self.sas_url_service.generate_sas_url(filename)
-                        substep.capture(sas_url)
-                    except Exception as e:
-                        msg = self.error_handler.handle_error("BLOB_NOT_FOUND", {"filename": filename, "error": str(e)})
-                        summary = await self.status_reporter.report_status("SAS URL Generation Failed", {"filename": filename})
-                        step.capture({"success": False, "error": msg, "summary": summary})
-                        return {
-                            "success": False,
-                            "error": msg,
-                            "summary": summary or msg
-                        }
+        vector_query = VectorizedQuery(
+            vector=embedding_resp.data[0].embedding,
+            k_nearest_neighbors=top_k,
+            fields="vector"
+        )
 
-                # Step 3: Submit translation request (with retry)
-                translation_result = await self.translation_service.translate_file(sas_url)
-                status_code = translation_result.get("status_code")
-                if status_code != 200:
-                    msg = self.error_handler.handle_error("TRANSLATION_FAILED", {"filename": filename, "status_code": status_code})
-                    summary = await self.status_reporter.report_status("Translation Failed", {"filename": filename, "details": translation_result})
-                    step.capture({"success": False, "error": msg, "summary": summary})
-                    return {
-                        "success": False,
-                        "error": msg,
-                        "summary": summary or msg
-                    }
+        # Step 2: Build OData filter for selected document titles
+        odata_filter = None
+        if filter_titles:
+            odata_parts = [f"title eq '{t}'" for t in filter_titles]
+            odata_filter = " or ".join(odata_parts)
 
-                # Step 4: Success
-                summary = await self.status_reporter.report_status("Translation Completed", {
-                    "filename": filename,
-                    "translation_response": translation_result.get("json", {})
-                })
-                step.capture({"success": True, "summary": summary, "result": translation_result.get("json", {})})
-                return {
-                    "success": True,
-                    "summary": summary,
-                    "result": translation_result.get("json", {})
-                }
-            except Exception as e:
-                msg = self.error_handler.handle_error("INTERNAL_ERROR", {"filename": filename, "error": str(e)})
-                summary = await self.status_reporter.report_status("Internal Error", {"filename": filename, "error": str(e)})
-                step.capture({"success": False, "error": msg, "summary": summary})
-                return {
-                    "success": False,
-                    "error": msg,
-                    "summary": summary or msg
-                }
+        # Step 3: Search
+        client = self.search_client._get_client()
+        search_kwargs = {
+            "search_text": query,
+            "vector_queries": [vector_query],
+            "top": top_k,
+            "select": ["chunk", "title"],
+        }
+        if odata_filter:
+            search_kwargs["filter"] = odata_filter
 
-# --- Main Agent Class ---
-class CustomTranslatorFileAgent:
-    """Main agent class composing all supporting classes."""
+        _t1 = _time.time()
+        results = client.search(**search_kwargs)
+        try:
+            trace_tool_call(
+                tool_name="search_client.search",
+                latency_ms=int((_time.time() - _t1) * 1000),
+                output=str(results)[:200] if results else None,
+                status="success",
+            )
+        except Exception:
+            pass
+
+        context_chunks = [r["chunk"] for r in results if r.get("chunk")]
+        return context_chunks
+
+# =========================
+# LLM SERVICE LAYER
+# =========================
+
+class LLMService:
+    """
+    Formats prompts, injects retrieved chunks as context, calls Azure OpenAI, returns structured response.
+    """
     def __init__(self):
-        # Compose adapters and services
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            api_key = Config.AZURE_OPENAI_API_KEY
+            if not api_key:
+                raise ValueError("AZURE_OPENAI_API_KEY not configured")
+            self._client = openai.AsyncAzureOpenAI(
+                api_key=api_key,
+                api_version="2024-02-01",
+                azure_endpoint=Config.AZURE_OPENAI_ENDPOINT,
+            )
+        return self._client
+
+    @with_content_safety(config=GUARDRAILS_CONFIG)
+    async def generate_response(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        context_chunks: List[str],
+        parameters: Optional[dict] = None
+    ) -> str:
+        """
+        Call LLM with system/user prompts and context, return structured summary.
+        """
+        client = self._get_client()
+        # Compose the system message with output format appended
+        system_message = f"{system_prompt}\n\nOutput Format: {OUTPUT_FORMAT}"
+        # Compose the user message with context chunks
+        context_str = "\n\n".join(context_chunks) if context_chunks else ""
+        user_message = f"{user_prompt}\n\nContext:\n{context_str}" if context_str else user_prompt
+
+        llm_kwargs = Config.get_llm_kwargs()
+        if parameters:
+            llm_kwargs.update(parameters)
+
+        _t0 = _time.time()
+        response = await client.chat.completions.create(
+            model=Config.LLM_MODEL or "gpt-4.1",
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_message}
+            ],
+            **llm_kwargs
+        )
+        content = response.choices[0].message.content
+        try:
+            trace_model_call(
+                provider="azure",
+                model_name=Config.LLM_MODEL or "gpt-4.1",
+                prompt_tokens=getattr(getattr(response, "usage", None), "prompt_tokens", 0) or 0,
+                completion_tokens=getattr(getattr(response, "usage", None), "completion_tokens", 0) or 0,
+                latency_ms=int((_time.time() - _t0) * 1000),
+                response_summary=content[:200] if content else "",
+            )
+        except Exception:
+            pass
+        return content
+
+# =========================
+# ERROR HANDLER & LOGGER
+# =========================
+
+class ErrorHandler:
+    """
+    Handles error codes, fallback logic, logging, and user notifications.
+    """
+    def __init__(self, logger):
+        self.logger = logger
+
+    def handle_error(self, error_code: str, context: Optional[dict] = None) -> str:
+        """
+        Map error codes to user-facing messages or fallback responses.
+        """
+        if error_code == "DOC_NOT_FOUND":
+            self.logger.log("error", "No relevant documents found", context or {})
+            return FALLBACK_RESPONSE
+        elif error_code == "MEASUREMENT_MISSING":
+            self.logger.log("error", "Required measurements missing in retrieved content", context or {})
+            return FALLBACK_RESPONSE
+        else:
+            self.logger.log("error", f"Unknown error code: {error_code}", context or {})
+            return "An unexpected error occurred. Please try again later."
+
+class Logger:
+    """
+    Audit logging of requests, responses, errors, and system events.
+    """
+    def __init__(self):
+        self._logger = logging.getLogger("agent")
+
+    @with_content_safety(config=GUARDRAILS_CONFIG)
+    def log(self, event_type: str, message: str, metadata: Optional[dict] = None) -> None:
+        try:
+            if event_type == "error":
+                self._logger.error(f"{message} | {metadata}")
+            elif event_type == "info":
+                self._logger.info(f"{message} | {metadata}")
+            else:
+                self._logger.debug(f"{message} | {metadata}")
+        except Exception:
+            pass
+
+# =========================
+# AGENT ORCHESTRATOR
+# =========================
+
+class AgentOrchestrator:
+    """
+    Coordinates the flow: receives user input, applies document filters, invokes retrieval and LLM services, enforces business rules, handles errors.
+    """
+    def __init__(self):
+        self.chunk_retriever = ChunkRetriever()
+        self.llm_service = LLMService()
         self.logger = Logger()
         self.error_handler = ErrorHandler(self.logger)
-        self.blob_adapter = AzureBlobAdapter()
-        self.file_validation_service = FileValidationService(self.blob_adapter)
-        self.sas_url_service = SASUrlService(self.blob_adapter)
-        self.translator_adapter = AzureTranslatorAdapter()
-        self.retry_handler = RetryHandler()
-        self.translation_service = TranslationService(self.translator_adapter, self.retry_handler)
-        self.status_reporter = StatusReporter(
-            llm_client_factory=get_llm_client,
-            model="gpt-4.1",
-            system_prompt=(
-                "You are a professional agent responsible for translating files stored in Azure Blob Storage. "
-                "When provided with a filename, perform the following steps: 1. Validate that the file exists in the specified Azure Blob container. "
-                "2. Generate a secure SAS URL for the file. 3. Submit the SAS URL to the Azure Translator service for translation. "
-                "4. If the translation service does not return a status 200, retry the request for up to 100 seconds. "
-                "5. Provide clear, concise, and professional updates on the process. 6. If the file is not found or translation fails after retries, "
-                "return an informative error message. Always ensure sensitive information is not exposed in responses."
-            ),
-            temperature=0.7,
-            max_tokens=2000
-        )
-        self.controller = AgentController(
-            self.file_validation_service,
-            self.sas_url_service,
-            self.translation_service,
-            self.status_reporter,
-            self.error_handler
-        )
 
-    async def handle_request(self, filename: str) -> dict:
-        return await self.controller.process_translation_request(filename)
+    @with_content_safety(config=GUARDRAILS_CONFIG)
+    async def analyze(self) -> dict:
+        """
+        Main entry point for comparative analysis; orchestrates retrieval and LLM response generation.
+        """
+        async with trace_step(
+            "retrieve_chunks",
+            step_type="tool_call",
+            decision_summary="Retrieve relevant planetary knowledge base chunks",
+            output_fn=lambda r: f"chunks={len(r) if r else 0}",
+        ) as step:
+            try:
+                context_chunks = await self.chunk_retriever.retrieve_chunks(
+                    query=SYSTEM_PROMPT,
+                    filter_titles=SELECTED_DOCUMENT_TITLES,
+                    top_k=5
+                )
+                step.capture(context_chunks)
+            except Exception as e:
+                self.logger.log("error", "Chunk retrieval failed", {"error": str(e)})
+                return {
+                    "success": False,
+                    "result": None,
+                    "error": "Knowledge base retrieval failed.",
+                    "tips": "Ensure the knowledge base is available and try again."
+                }
 
-# --- LLM Integration (OpenAI) ---
-@with_content_safety(config=GUARDRAILS_CONFIG)
-def get_llm_client():
-    import openai
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY not configured")
-    return openai.AsyncOpenAI(api_key=api_key)
+        if not context_chunks or len(context_chunks) == 0:
+            error_msg = self.error_handler.handle_error("DOC_NOT_FOUND", {})
+            return {
+                "success": False,
+                "result": None,
+                "error": error_msg,
+                "tips": "Try updating the knowledge base or selecting different documents."
+            }
 
-# --- FastAPI App ---
+        async with trace_step(
+            "generate_llm_response",
+            step_type="llm_call",
+            decision_summary="Generate structured comparative analysis using LLM",
+            output_fn=lambda r: f"response_length={len(r) if r else 0}",
+        ) as step:
+            try:
+                raw_response = await self.llm_service.generate_response(
+                    system_prompt=SYSTEM_PROMPT,
+                    user_prompt=SYSTEM_PROMPT,
+                    context_chunks=context_chunks,
+                    parameters={
+                        "temperature": 0.7,
+                        "max_tokens": 2000
+                    }
+                )
+                step.capture(raw_response)
+            except Exception as e:
+                self.logger.log("error", "LLM generation failed", {"error": str(e)})
+                error_msg = self.error_handler.handle_error("DOC_NOT_FOUND", {})
+                return {
+                    "success": False,
+                    "result": None,
+                    "error": error_msg,
+                    "tips": "Try again later or check LLM service availability."
+                }
+
+        # Sanitize LLM output
+        result = sanitize_llm_output(raw_response, content_type="text")
+        if not result or FALLBACK_RESPONSE in result:
+            error_msg = self.error_handler.handle_error("MEASUREMENT_MISSING", {})
+            return {
+                "success": False,
+                "result": None,
+                "error": error_msg,
+                "tips": "Requested measurements may not be present in the selected documents."
+            }
+
+        return {
+            "success": True,
+            "result": result,
+            "error": None,
+            "tips": None
+        }
+
+# =========================
+# MAIN AGENT CLASS
+# =========================
+
+class PlanetaryComparativeAnalysisAgent:
+    """
+    Main agent class. Orchestrates the planetary comparative analysis workflow.
+    """
+    def __init__(self):
+        self.orchestrator = AgentOrchestrator()
+
+    @trace_agent(agent_name=_obs_settings.AGENT_NAME, project_name=_obs_settings.PROJECT_NAME)
+    @with_content_safety(config=GUARDRAILS_CONFIG)
+    async def process(self) -> dict:
+        """
+        Entrypoint for the agent. Returns structured analysis or error.
+        """
+        return await self.orchestrator.analyze()
+
+# =========================
+# FASTAPI APP & ENDPOINTS
+# =========================
+
+@asynccontextmanager
+async def _obs_lifespan(application):
+    """Initialise observability on startup, clean up on shutdown."""
+    try:
+        _obs_startup_logger.info('')
+        _obs_startup_logger.info('========== Agent Configuration Summary ==========')
+        _obs_startup_logger.info(f'Environment: {getattr(Config, "ENVIRONMENT", "N/A")}')
+        _obs_startup_logger.info(f'Agent: {getattr(Config, "AGENT_NAME", "N/A")}')
+        _obs_startup_logger.info(f'Project: {getattr(Config, "PROJECT_NAME", "N/A")}')
+        _obs_startup_logger.info(f'LLM Provider: {getattr(Config, "MODEL_PROVIDER", "N/A")}')
+        _obs_startup_logger.info(f'LLM Model: {getattr(Config, "LLM_MODEL", "N/A")}')
+        _cs_endpoint = getattr(Config, 'AZURE_CONTENT_SAFETY_ENDPOINT', None)
+        _cs_key = getattr(Config, 'AZURE_CONTENT_SAFETY_KEY', None)
+        if _cs_endpoint and _cs_key:
+            _obs_startup_logger.info('Content Safety: Enabled (Azure Content Safety)')
+            _obs_startup_logger.info(f'Content Safety Endpoint: {_cs_endpoint}')
+        else:
+            _obs_startup_logger.info('Content Safety: Not Configured')
+        _obs_startup_logger.info('Observability Database: Azure SQL')
+        _obs_startup_logger.info(f'Database Server: {getattr(Config, "OBS_AZURE_SQL_SERVER", "N/A")}')
+        _obs_startup_logger.info(f'Database Name: {getattr(Config, "OBS_AZURE_SQL_DATABASE", "N/A")}')
+        _obs_startup_logger.info('===============================================')
+        _obs_startup_logger.info('')
+    except Exception as _e:
+        _obs_startup_logger.warning('Config summary failed: %s', _e)
+
+    _obs_startup_logger.info('')
+    _obs_startup_logger.info('========== Content Safety & Guardrails ==========')
+    if GUARDRAILS_CONFIG.get('content_safety_enabled'):
+        _obs_startup_logger.info('Content Safety: Enabled')
+        _obs_startup_logger.info(f'  - Severity Threshold: {GUARDRAILS_CONFIG.get("content_safety_severity_threshold", "N/A")}')
+        _obs_startup_logger.info(f'  - Check Toxicity: {GUARDRAILS_CONFIG.get("check_toxicity", False)}')
+        _obs_startup_logger.info(f'  - Check Jailbreak: {GUARDRAILS_CONFIG.get("check_jailbreak", False)}')
+        _obs_startup_logger.info(f'  - Check PII Input: {GUARDRAILS_CONFIG.get("check_pii_input", False)}')
+        _obs_startup_logger.info(f'  - Check Credentials Output: {GUARDRAILS_CONFIG.get("check_credentials_output", False)}')
+    else:
+        _obs_startup_logger.info('Content Safety: Disabled')
+    _obs_startup_logger.info('===============================================')
+    _obs_startup_logger.info('')
+
+    _obs_startup_logger.info('========== Initializing Agent Services ==========')
+    # 1. Observability DB schema (imports are inside function — only needed at startup)
+    try:
+        from observability.database.engine import create_obs_database_engine
+        from observability.database.base import ObsBase
+        import observability.database.models  # noqa: F401
+        _obs_engine = create_obs_database_engine()
+        ObsBase.metadata.create_all(bind=_obs_engine, checkfirst=True)
+        _obs_startup_logger.info('✓ Observability database connected')
+    except Exception as _e:
+        _obs_startup_logger.warning('✗ Observability database connection failed (metrics will not be saved)')
+    # 2. OpenTelemetry tracer (initialize_tracer is pre-injected at top level)
+    try:
+        _t = initialize_tracer()
+        if _t is not None:
+            _obs_startup_logger.info('✓ Telemetry monitoring enabled')
+        else:
+            _obs_startup_logger.warning('✗ Telemetry monitoring disabled')
+    except Exception as _e:
+        _obs_startup_logger.warning('✗ Telemetry monitoring failed to initialize')
+    _obs_startup_logger.info('=================================================')
+    _obs_startup_logger.info('')
+    yield
+
 app = FastAPI(
-    title="Custom Translator File Agent",
-    description="Professional agent for translating files in Azure Blob Storage.",
-    version="1.0.0"
+    title="Planetary Comparative Analysis Assistant",
+    description="Compares Earth and Jupiter using authoritative knowledge base documents. Returns structured, cited scientific summaries.",
+    version=Config.SERVICE_VERSION if hasattr(Config, "SERVICE_VERSION") else "1.0.0",
+    lifespan=_obs_lifespan
 )
 
-# CORS (allow all origins for demo; restrict in production)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+agent_instance = PlanetaryComparativeAnalysisAgent()
 
-agent = CustomTranslatorFileAgent()
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "ok"}
 
-# --- Exception Handlers ---
-@app.exception_handler(ValidationError)
+@app.post("/analyze", response_model=AnalyzeResponse)
 @with_content_safety(config=GUARDRAILS_CONFIG)
-async def validation_exception_handler(request: Request, exc: ValidationError):
-    logger.warning(f"Validation error: {exc}")
+async def analyze_endpoint():
+    """
+    Main endpoint for planetary comparative analysis.
+    No user input required; uses SYSTEM_PROMPT and SELECTED_DOCUMENT_TITLES internally.
+    """
+    try:
+        result = await agent_instance.process()
+        return AnalyzeResponse(**result)
+    except Exception as e:
+        logger.error(f"Unhandled error in /analyze: {e}")
+        return AnalyzeResponse(
+            success=False,
+            result=None,
+            error="An unexpected error occurred. Please try again later.",
+            tips="Check input and try again."
+        )
+
+@app.get("/status")
+async def status_endpoint():
+    """Returns agent status and configuration."""
+    return {
+        "agent_name": getattr(Config, "AGENT_NAME", "PlanetaryComparativeAnalysisAgent"),
+        "project_name": getattr(Config, "PROJECT_NAME", "N/A"),
+        "version": getattr(Config, "SERVICE_VERSION", "1.0.0"),
+        "llm_model": getattr(Config, "LLM_MODEL", "gpt-4.1"),
+        "rag_enabled": True,
+        "selected_documents": SELECTED_DOCUMENT_TITLES,
+    }
+
+# =========================
+# ERROR HANDLING FOR MALFORMED JSON
+# =========================
+
+@app.exception_handler(RequestValidationError)
+@with_content_safety(config=GUARDRAILS_CONFIG)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.warning(f"Malformed JSON in request: {exc}")
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
             "success": False,
-            "error": "Input validation failed.",
-            "details": exc.errors(),
-            "tips": "Ensure your JSON is well-formed and the filename is valid."
-        }
+            "result": None,
+            "error": "Malformed JSON or invalid request body.",
+            "tips": "Check your JSON formatting (quotes, commas, brackets) and ensure all required fields are present."
+        },
     )
 
-@app.exception_handler(HTTPException)
+@app.exception_handler(ValidationError)
 @with_content_safety(config=GUARDRAILS_CONFIG)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    logger.warning(f"HTTP error: {exc.detail}")
+async def pydantic_validation_exception_handler(request: Request, exc: ValidationError):
+    logger.warning(f"Pydantic validation error: {exc}")
     return JSONResponse(
-        status_code=exc.status_code,
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
             "success": False,
-            "error": exc.detail,
-            "tips": "Check your request and try again."
-        }
+            "result": None,
+            "error": "Input validation failed.",
+            "tips": "Check your input values and types."
+        },
     )
 
 @app.exception_handler(Exception)
 @with_content_safety(config=GUARDRAILS_CONFIG)
 async def generic_exception_handler(request: Request, exc: Exception):
-    logger.warning(f"Unhandled error: {exc}")
+    logger.error(f"Unhandled exception: {exc}")
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
             "success": False,
+            "result": None,
             "error": "Internal server error.",
-            "tips": "Please try again later or contact support."
-        }
+            "tips": "Try again later or contact support."
+        },
     )
 
-# --- API Endpoint ---
-@app.post("/translate", response_model=Dict[str, Any])
-@with_content_safety(config=GUARDRAILS_CONFIG)
-async def translate_file(request: Request):
-    try:
-        data = await request.json()
-    except Exception as e:
-        logger.warning(f"Malformed JSON: {e}")
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={
-                "success": False,
-                "error": "Malformed JSON in request body.",
-                "tips": "Check for missing quotes, commas, or brackets in your JSON."
-            }
-        )
-    try:
-        req = TranslationRequest(**data)
-    except ValidationError as ve:
-        logger.warning(f"Validation error: {ve}")
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={
-                "success": False,
-                "error": "Input validation failed.",
-                "details": ve.errors(),
-                "tips": "Ensure your JSON is well-formed and the filename is valid."
-            }
-        )
-    # Input size check
-    if len(req.filename) > 256:
-        return JSONResponse(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            content={
-                "success": False,
-                "error": "Filename too long.",
-                "tips": "Filename must be 256 characters or less."
-            }
-        )
-    # Process translation request
-    result = await agent.handle_request(req.filename)
-    # Fallback response if needed
-    if not result.get("success"):
-        fallback = (
-            "The requested file could not be found or the translation service is unavailable. "
-            "Please verify the filename and try again, or contact support for assistance."
-        )
-        result.setdefault("summary", fallback)
-    return JSONResponse(
-        status_code=status.HTTP_200_OK if result.get("success") else status.HTTP_400_BAD_REQUEST,
-        content=result
+# =========================
+# AGENT ENTRYPOINT
+# =========================
+
+async def _run_agent():
+    """Entrypoint: runs the agent with observability (trace collection only)."""
+    import uvicorn
+
+    # Unified logging config — routes uvicorn, agent, and observability through
+    # the same handler so all telemetry appears in a single consistent stream.
+    _LOG_CONFIG = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "default": {
+                "()": "uvicorn.logging.DefaultFormatter",
+                "fmt": "%(levelprefix)s %(name)s: %(message)s",
+                "use_colors": None,
+            },
+            "access": {
+                "()": "uvicorn.logging.AccessFormatter",
+                "fmt": '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+            },
+        },
+        "handlers": {
+            "default": {
+                "formatter": "default",
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stderr",
+            },
+            "access": {
+                "formatter": "access",
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stdout",
+            },
+        },
+        "loggers": {
+            "uvicorn":        {"handlers": ["default"], "level": "INFO", "propagate": False},
+            "uvicorn.error":  {"level": "INFO"},
+            "uvicorn.access": {"handlers": ["access"], "level": "INFO", "propagate": False},
+            "agent":          {"handlers": ["default"], "level": "INFO", "propagate": False},
+            "__main__":       {"handlers": ["default"], "level": "INFO", "propagate": False},
+            "observability": {"handlers": ["default"], "level": "INFO", "propagate": False},
+            "config": {"handlers": ["default"], "level": "INFO", "propagate": False},
+            "azure":   {"handlers": ["default"], "level": "WARNING", "propagate": False},
+            "urllib3": {"handlers": ["default"], "level": "WARNING", "propagate": False},
+        },
+    }
+
+    config = uvicorn.Config(
+        "agent:app",
+        host="0.0.0.0",
+        port=8080,
+        reload=False,
+        log_level="info",
+        log_config=_LOG_CONFIG,
     )
-
-# --- Main Entrypoint ---
-
-
-async def _run_with_eval_service():
-    """Entrypoint: initialises observability then runs the agent."""
-    import logging as _obs_log
-    _obs_logger = _obs_log.getLogger(__name__)
-    # ── 1. Observability DB schema ─────────────────────────────────────
-    try:
-        from observability.database.engine import create_obs_database_engine
-        from observability.database.base import ObsBase
-        import observability.database.models  # noqa: F401 – register ORM models
-        _obs_engine = create_obs_database_engine()
-        ObsBase.metadata.create_all(bind=_obs_engine, checkfirst=True)
-    except Exception as _e:
-        _obs_logger.warning('Observability DB init skipped: %s', _e)
-    # ── 2. OpenTelemetry tracer ────────────────────────────────────────
-    try:
-        from observability.instrumentation import initialize_tracer
-        initialize_tracer()
-    except Exception as _e:
-        _obs_logger.warning('Tracer init skipped: %s', _e)
-    # ── 3. Evaluation background worker ───────────────────────────────
-    _stop_eval = None
-    try:
-        from observability.evaluation_background_service import (
-            start_evaluation_worker as _start_eval,
-            stop_evaluation_worker as _stop_eval_fn,
-        )
-        await _start_eval()
-        _stop_eval = _stop_eval_fn
-    except Exception as _e:
-        _obs_logger.warning('Evaluation worker start skipped: %s', _e)
-    # ── 4. Run the agent ───────────────────────────────────────────────
-    try:
-        import uvicorn
-        # Validate config only when running as main
-        try:
-        Config.validate()
-        except Exception as e:
-        logger.error(f"Configuration error: {e}")
-        print(f"Configuration error: {e}")
-        exit(1)
-        logger.info("Starting Custom Translator File Agent API on http://0.0.0.0:8000")
-        uvicorn.run("agent:app", host="0.0.0.0", port=8000, reload=False)
-        pass  # TODO: run your agent here
-    finally:
-        if _stop_eval is not None:
-            try:
-                await _stop_eval()
-            except Exception:
-                pass
+    server = uvicorn.Server(config)
+    await server.serve()
 
 
 if __name__ == "__main__":
-    import asyncio as _asyncio
-    _asyncio.run(_run_with_eval_service())
+    _asyncio.run(_run_agent())

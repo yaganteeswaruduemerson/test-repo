@@ -131,7 +131,12 @@ _tool_registry: Dict[int, List[Dict[str, Any]]] = {}  # trace_id → [tool_call_
 _tool_registry_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
-# Step-index stack — thread-local stack tracking the current step index.
+# Step-index stack — context-local stack tracking the current step index.
+#
+# Using contextvars.ContextVar instead of threading.local() so that the stack
+# propagates correctly across async tasks and coroutines running on the same
+# thread (threading.local() would share one stack value across all concurrent
+# coroutines on an asyncio event loop, causing incorrect step attribution).
 #
 # trace_step_sync / trace_step push the step_index on entry and pop on exit.
 # trace_tool_call / trace_model_call read the top of the stack to stamp
@@ -139,26 +144,30 @@ _tool_registry_lock = threading.Lock()
 # derive each step's output_summary from its last tool / model call without
 # any explicit capture() call in business code.
 # ---------------------------------------------------------------------------
-_step_index_local = threading.local()
+_step_index_stack: contextvars.ContextVar[List[int]] = contextvars.ContextVar(
+    '_step_index_stack', default=[]
+)
 
 
 def _push_current_step(step_index: int) -> None:
-    """Push *step_index* onto the thread-local step stack."""
-    if not hasattr(_step_index_local, 'stack'):
-        _step_index_local.stack = []
-    _step_index_local.stack.append(step_index)
+    """Push *step_index* onto the context-local step stack."""
+    # Always copy the list so other concurrent tasks are not affected.
+    new_stack = list(_step_index_stack.get())
+    new_stack.append(step_index)
+    _step_index_stack.set(new_stack)
 
 
 def _pop_current_step() -> None:
-    """Pop the innermost step index from the thread-local stack."""
-    stack = getattr(_step_index_local, 'stack', [])
-    if stack:
-        stack.pop()
+    """Pop the innermost step index from the context-local stack."""
+    current = list(_step_index_stack.get())
+    if current:
+        current.pop()
+    _step_index_stack.set(current)
 
 
 def _get_current_step_index() -> int:
     """Return the active step index, or -1 when outside any step context."""
-    stack = getattr(_step_index_local, 'stack', [])
+    stack = _step_index_stack.get()
     return stack[-1] if stack else -1
 
 
@@ -324,6 +333,7 @@ def trace_agent(
     agent_name: Optional[str] = None,
     agent_version: Optional[str] = None,
     environment: Optional[str] = None,
+    project_name: Optional[str] = None,
     tags: Optional[Dict[str, Any]] = None,
 ):
     """
@@ -339,6 +349,7 @@ def trace_agent(
         agent_name: Name of the agent (auto-detected from function name if not provided)
         agent_version: Version of the agent
         environment: Execution environment (dev/staging/production)
+        project_name: Name of the project this agent belongs to
         tags: Additional tags for filtering/grouping
     
     Returns:
@@ -353,41 +364,54 @@ def trace_agent(
             async def async_wrapper(*args, **kwargs):
                 # Get tracer
                 tracer = get_tracer()
-                
+
                 if tracer is None:
                     # Tracing not available, run without tracing
+                    import logging as _ta_log
+                    _ta_log.getLogger(__name__).warning(
+                        "@trace_agent(%r): tracer is None — execution will proceed WITHOUT observability. "
+                        "Call initialize_tracer() before running the agent.",
+                        inferred_agent_name,
+                    )
                     return await func(*args, **kwargs)
-                
-                # Stamp enqueue time BEFORE opening the OTel span so that
-                # span-setup overhead is captured as queue_time_ms (Option A).
+
+                # Stamp enqueue time BEFORE opening the OTel span
                 _enqueue_ns = time.perf_counter_ns()
 
                 # Start OpenTelemetry span
+                import logging as _ta_log
+                _ta_log.getLogger(__name__).info(
+                    "@trace_agent(%r): opening agent/ span", inferred_agent_name
+                )
                 with tracer.start_as_current_span(f"agent/{inferred_agent_name}") as span:
                     _execution_start_ns = time.perf_counter_ns()
-                    _queue_time_ms = max(0, int((_execution_start_ns - _enqueue_ns) / 1_000_000))
-                    span.set_attribute("queue_time_ms", _queue_time_ms)
                     start_time = time.time()
                     
                     # Set span attributes
                     span.set_attribute("agent_name", inferred_agent_name)
-                    if agent_version:
-                        span.set_attribute("agent_version", agent_version)
+                    if project_name:
+                        span.set_attribute("project_name", project_name)
+                    
+                    # Set agent version (default to settings.VERSION if not provided)
+                    _agent_version = agent_version
+                    if not _agent_version:
+                        try:
+                            from config import settings
+                            _agent_version = settings.VERSION
+                        except Exception:
+                            pass
+                    if _agent_version:
+                        span.set_attribute("agent_version", _agent_version)
+                    
                     if environment:
                         span.set_attribute("environment", environment)
                     else:
                         span.set_attribute("environment", _get_environment())
-                    if tags:
-                        for key, value in tags.items():
-                            span.set_attribute(f"tag.{key}", str(value))
 
                     # Propagate shared pipeline IDs if set in the current context
                     _sid = _active_session_id.get()
                     if _sid:
                         span.set_attribute("session_id", _sid)
-                    _cid = _active_correlation_id.get()
-                    if _cid:
-                        span.set_attribute("correlation_id", _cid)
 
                     # Extract user query before execution
                     user_query = _extract_user_query(args, kwargs, func)
@@ -413,27 +437,50 @@ def trace_agent(
                         agent_response = _extract_agent_response(result)
                         if agent_response:
                             span.set_attribute("agent_response", agent_response)
-                        
-                        # Set success status
-                        span.set_status(Status(StatusCode.OK))
-                        
+
+                        # Set span status — treat success=False in the response as an error
+                        _result_failed = (
+                            isinstance(result, dict)
+                            and result.get("success") is False
+                            and result.get("error")
+                        )
+                        if _result_failed:
+                            _err_msg = str(result.get("error", "agent returned success=False"))
+                            span.set_status(Status(StatusCode.ERROR, _err_msg))
+                            span.set_attribute("error_type", "AgentExecutionError")
+                            span.set_attribute("error_message", _err_msg)
+                            # Capture call stack since this is not a raised exception
+                            span.set_attribute("stack_trace", ''.join(traceback.format_stack()))
+                        else:
+                            span.set_status(Status(StatusCode.OK))
+
                         # Calculate duration
                         duration_ms = (time.time() - start_time) * 1000
-                        span.set_attribute("duration_ms", int(duration_ms))
-                        
+                        _ta_log.getLogger(__name__).info(
+                            "@trace_agent(%r): span closed %s — duration_ms=%d, "
+                            "span will be exported to DB now",
+                            inferred_agent_name,
+                            "with ERROR" if _result_failed else "OK",
+                            int(duration_ms),
+                        )
+
                         return result
-                        
+
                     except Exception as e:
                         # Record error
                         span.set_status(Status(StatusCode.ERROR, str(e)))
                         span.set_attribute("error_type", type(e).__name__)
                         span.set_attribute("error_message", str(e))
                         span.set_attribute("stack_trace", traceback.format_exc())
-                        
+
                         # Calculate duration
                         duration_ms = (time.time() - start_time) * 1000
-                        span.set_attribute("duration_ms", int(duration_ms))
-                        
+                        _ta_log.getLogger(__name__).error(
+                            "@trace_agent(%r): span closed with ERROR — %s: %s "
+                            "(span will still be exported to DB)",
+                            inferred_agent_name, type(e).__name__, e,
+                        )
+
                         raise
             
             return async_wrapper  # type: ignore
@@ -446,38 +493,47 @@ def trace_agent(
 
                 if tracer is None:
                     # Tracing not available, run without tracing
+                    import logging as _ta_log
+                    _ta_log.getLogger(__name__).warning(
+                        "@trace_agent(%r) [sync]: tracer is None — execution will proceed WITHOUT observability. "
+                        "Call initialize_tracer() before running the agent.",
+                        inferred_agent_name,
+                    )
                     return func(*args, **kwargs)
 
-                # Stamp enqueue time BEFORE opening the OTel span so that
-                # span-setup overhead is captured as queue_time_ms (Option A).
+                # Stamp enqueue time BEFORE opening the OTel span
                 _enqueue_ns = time.perf_counter_ns()
 
                 # Start OpenTelemetry span
                 with tracer.start_as_current_span(f"agent/{inferred_agent_name}") as span:
                     _execution_start_ns = time.perf_counter_ns()
-                    _queue_time_ms = max(0, int((_execution_start_ns - _enqueue_ns) / 1_000_000))
-                    span.set_attribute("queue_time_ms", _queue_time_ms)
                     start_time = time.time()
                     
                     # Set span attributes
                     span.set_attribute("agent_name", inferred_agent_name)
-                    if agent_version:
-                        span.set_attribute("agent_version", agent_version)
+                    if project_name:
+                        span.set_attribute("project_name", project_name)
+                    
+                    # Set agent version (default to settings.VERSION if not provided)
+                    _agent_version = agent_version
+                    if not _agent_version:
+                        try:
+                            from config import settings
+                            _agent_version = settings.VERSION
+                        except Exception:
+                            pass
+                    if _agent_version:
+                        span.set_attribute("agent_version", _agent_version)
+                    
                     if environment:
                         span.set_attribute("environment", environment)
                     else:
                         span.set_attribute("environment", _get_environment())
-                    if tags:
-                        for key, value in tags.items():
-                            span.set_attribute(f"tag.{key}", str(value))
 
                     # Propagate shared pipeline IDs if set in the current context
                     _sid = _active_session_id.get()
                     if _sid:
                         span.set_attribute("session_id", _sid)
-                    _cid = _active_correlation_id.get()
-                    if _cid:
-                        span.set_attribute("correlation_id", _cid)
 
                     # Extract user query before execution
                     user_query = _extract_user_query(args, kwargs, func)
@@ -502,13 +558,25 @@ def trace_agent(
                         agent_response = _extract_agent_response(result)
                         if agent_response:
                             span.set_attribute("agent_response", agent_response)
-                        
-                        # Set success status
-                        span.set_status(Status(StatusCode.OK))
-                        
+
+                        # Set span status — treat success=False in the response as an error
+                        _result_failed = (
+                            isinstance(result, dict)
+                            and result.get("success") is False
+                            and result.get("error")
+                        )
+                        if _result_failed:
+                            _err_msg = str(result.get("error", "agent returned success=False"))
+                            span.set_status(Status(StatusCode.ERROR, _err_msg))
+                            span.set_attribute("error_type", "AgentExecutionError")
+                            span.set_attribute("error_message", _err_msg)
+                            # Capture call stack since this is not a raised exception
+                            span.set_attribute("stack_trace", ''.join(traceback.format_stack()))
+                        else:
+                            span.set_status(Status(StatusCode.OK))
+
                         # Calculate duration
                         duration_ms = (time.time() - start_time) * 1000
-                        span.set_attribute("duration_ms", int(duration_ms))
 
                         return result
                     except Exception as e:
@@ -520,13 +588,75 @@ def trace_agent(
                         
                         # Calculate duration
                         duration_ms = (time.time() - start_time) * 1000
-                        span.set_attribute("duration_ms", int(duration_ms))
 
                         raise
 
             return sync_wrapper  # type: ignore
     
     return decorator
+
+
+def _trace_step_setup(
+    step_name: str,
+    step_type: Optional[str],
+    decision_summary: Optional[str],
+    output_fn: Optional[Callable[[Any], str]],
+):
+    """Common setup for both trace_step and trace_step_sync."""
+    parent_span = trace.get_current_span()
+    start_time = time.time()
+    start_dt = datetime.now(timezone.utc)
+
+    # Register step in the module-level registry.
+    step_index = _registry_claim_step(
+        parent_span, step_name, step_type or 'unknown', decision_summary, start_dt
+    )
+    handle = _StepHandle(parent_span, step_index, output_fn=output_fn)
+    _push_current_step(step_index)
+    
+    return parent_span, start_time, start_dt, step_index, handle
+
+
+def _trace_step_enter(step_name: str, step_index: int, step_type: Optional[str], decision_summary: Optional[str]):
+    """Enter the step span (common for both sync/async)."""
+    tracer = get_tracer()
+    if tracer is None:
+        return None
+    
+    child_span = tracer.start_as_current_span(f'step/{step_name}').__enter__()
+    if child_span and child_span.is_recording():
+        child_span.set_attribute('step_name', step_name)
+        child_span.set_attribute('step_index', step_index)
+        if step_type:
+            child_span.set_attribute('step_type', step_type)
+        if decision_summary:
+            child_span.set_attribute('decision_summary', decision_summary)
+    return child_span
+
+
+def _trace_step_exit_success(child_span, parent_span, step_index, start_time, handle):
+    """Handle successful step completion (common for both sync/async)."""
+    latency_ms = int((time.time() - start_time) * 1000)
+    if child_span and child_span.is_recording():
+        child_span.set_attribute('latency_ms', latency_ms)
+        child_span.set_status(Status(StatusCode.OK))
+    _registry_finish_step(parent_span, step_index, 'success', latency_ms,
+                          output_summary=handle.output_summary)
+
+
+def _trace_step_exit_error(child_span, parent_span, step_index, start_time, handle, exc):
+    """Handle step error (common for both sync/async)."""
+    latency_ms = int((time.time() - start_time) * 1000)
+    if child_span and child_span.is_recording():
+        child_span.set_attribute('latency_ms', latency_ms)
+        child_span.set_status(Status(StatusCode.ERROR, str(exc)))
+        child_span.set_attribute('error_type', type(exc).__name__)
+        child_span.set_attribute('error_message', str(exc))
+    _registry_finish_step(parent_span, step_index, 'failure', latency_ms, type(exc).__name__,
+                          output_summary=handle.output_summary)
+
+
+from contextlib import contextmanager as _contextmanager
 
 
 @asynccontextmanager
@@ -537,19 +667,7 @@ async def trace_step(
     output_fn: Optional[Callable[[Any], str]] = None,
 ):
     """
-    Context manager for tracing individual steps within an agent using OpenTelemetry.
-
-    Encodes step data as flat ``step.<i>.*`` attributes on the **parent** agent
-    span so that ``_span_to_trace_context`` can reconstruct a properly ordered
-    ``steps`` list at export time.  A child span is still emitted for
-    distributed-tracing visibility, but the structured step payload lives on
-    the parent – so it is never silently discarded by the exporter filter that
-    only processes ``agent/`` spans.
-
-    Declare *how* to format the step output via ``output_fn`` — an
-    ``(Any) -> str`` callable applied to whatever value you pass to
-    ``step.capture(result)`` inside the block.  This keeps extraction logic
-    at the wrapper definition rather than embedded in business code.
+    Async context manager for tracing individual steps within an agent.
 
     Usage::
 
@@ -567,63 +685,22 @@ async def trace_step(
         step_type:      Semantic type (``"llm_call"``, ``"tool_call"``, ``"parse"``, …).
         output_fn:      ``(Any) -> str`` extractor applied by ``step.capture()``.
     """
-    parent_span = trace.get_current_span()
-    start_time = time.time()
-    start_dt = datetime.now(timezone.utc)
-
-    # Register step in the module-level registry.
-    step_index = _registry_claim_step(
-        parent_span, step_name, step_type or 'unknown', decision_summary, start_dt
+    parent_span, start_time, start_dt, step_index, handle = _trace_step_setup(
+        step_name, step_type, decision_summary, output_fn
     )
-    handle = _StepHandle(parent_span, step_index, output_fn=output_fn)
-    _push_current_step(step_index)
-
-    tracer = get_tracer()
-    if tracer is None:
-        try:
-            yield handle
-            latency_ms = int((time.time() - start_time) * 1000)
-            _registry_finish_step(parent_span, step_index, 'success', latency_ms,
-                                  output_summary=handle.output_summary)
-        except Exception as e:
-            latency_ms = int((time.time() - start_time) * 1000)
-            _registry_finish_step(parent_span, step_index, 'failure', latency_ms, type(e).__name__,
-                                  output_summary=handle.output_summary)
-            raise
-        finally:
-            _pop_current_step()
-        return
-
-    # Emit a child span for distributed-tracing visibility (Jaeger / OTLP)
-    with tracer.start_as_current_span(f'step/{step_name}') as child_span:
-        child_span.set_attribute('step_name', step_name)
-        child_span.set_attribute('step_index', step_index)
-        if step_type:
-            child_span.set_attribute('step_type', step_type)
-        if decision_summary:
-            child_span.set_attribute('decision_summary', decision_summary)
-
-        try:
-            yield handle
-            latency_ms = int((time.time() - start_time) * 1000)
-            child_span.set_attribute('latency_ms', latency_ms)
-            child_span.set_status(Status(StatusCode.OK))
-            _registry_finish_step(parent_span, step_index, 'success', latency_ms,
-                                  output_summary=handle.output_summary)
-        except Exception as e:
-            latency_ms = int((time.time() - start_time) * 1000)
-            child_span.set_attribute('latency_ms', latency_ms)
-            child_span.set_status(Status(StatusCode.ERROR, str(e)))
-            child_span.set_attribute('error_type', type(e).__name__)
-            child_span.set_attribute('error_message', str(e))
-            _registry_finish_step(parent_span, step_index, 'failure', latency_ms, type(e).__name__,
-                                  output_summary=handle.output_summary)
-            raise
-        finally:
-            _pop_current_step()
-
-
-from contextlib import contextmanager as _contextmanager
+    
+    child_span = _trace_step_enter(step_name, step_index, step_type, decision_summary)
+    
+    try:
+        yield handle
+        _trace_step_exit_success(child_span, parent_span, step_index, start_time, handle)
+    except Exception as e:
+        _trace_step_exit_error(child_span, parent_span, step_index, start_time, handle, e)
+        raise
+    finally:
+        if child_span:
+            child_span.__exit__(None, None, None)
+        _pop_current_step()
 
 
 @_contextmanager
@@ -636,14 +713,7 @@ def trace_step_sync(
     """
     Synchronous context manager for tracing individual steps within a sync agent.
 
-    Stores step data in a module-level registry keyed by the parent agent span-id
-    so that ``_span_to_trace_context`` can reliably reconstruct a ``steps`` list
-    at export time, regardless of OTel context-manager internals.
-
-    Declare *how* to format the step output via ``output_fn`` — an
-    ``(Any) -> str`` callable applied to whatever value you pass to
-    ``step.capture(result)`` inside the block.  This keeps extraction logic
-    at the wrapper definition rather than embedded in business code::
+    Usage::
 
         with trace_step_sync(
             "classify",
@@ -651,69 +721,31 @@ def trace_step_sync(
             output_fn=lambda r: f"classification={r.get('classification')}",
         ) as step:
             result = run_classification(data)
-            step.capture(result)   # output_fn applied here, no formatting in business code
+            step.capture(result)
 
     Args:
         step_name:        Logical name (e.g. ``"parse_input"``, ``"classify"``).
         decision_summary: Optional human-readable note about what this step does.
-        step_type:        Semantic category: ``"parse"``, ``"llm_call"``, ``"process"``,
-                          ``"format"``, ``"tool_call"``, ``"plan"``, ``"final"``.
+        step_type:        Semantic category: ``"parse"``, ``"llm_call"``, ``"process"``, etc.
         output_fn:        ``(Any) -> str`` extractor applied by ``step.capture()``.
     """
-    parent_span = trace.get_current_span()
-    start_time = time.time()
-    start_dt = datetime.now(timezone.utc)
-
-    # Register step in the module-level registry.
-    step_index = _registry_claim_step(
-        parent_span, step_name, step_type or 'unknown', decision_summary, start_dt
+    parent_span, start_time, start_dt, step_index, handle = _trace_step_setup(
+        step_name, step_type, decision_summary, output_fn
     )
-    handle = _StepHandle(parent_span, step_index, output_fn=output_fn)
-    _push_current_step(step_index)
+    
+    child_span = _trace_step_enter(step_name, step_index, step_type, decision_summary)
+    
+    try:
+        yield handle
+        _trace_step_exit_success(child_span, parent_span, step_index, start_time, handle)
+    except Exception as e:
+        _trace_step_exit_error(child_span, parent_span, step_index, start_time, handle, e)
+        raise
+    finally:
+        if child_span:
+            child_span.__exit__(None, None, None)
+        _pop_current_step()
 
-    tracer = get_tracer()
-    if tracer is None:
-        try:
-            yield handle
-            latency_ms = int((time.time() - start_time) * 1000)
-            _registry_finish_step(parent_span, step_index, 'success', latency_ms,
-                                  output_summary=handle.output_summary)
-        except Exception as e:
-            latency_ms = int((time.time() - start_time) * 1000)
-            _registry_finish_step(parent_span, step_index, 'failure', latency_ms, type(e).__name__,
-                                  output_summary=handle.output_summary)
-            raise
-        finally:
-            _pop_current_step()
-        return
-
-    # Emit a child span for distributed-tracing visibility.
-    with tracer.start_as_current_span(f'step/{step_name}') as child_span:
-        child_span.set_attribute('step_name', step_name)
-        child_span.set_attribute('step_index', step_index)
-        if step_type:
-            child_span.set_attribute('step_type', step_type)
-        if decision_summary:
-            child_span.set_attribute('decision_summary', decision_summary)
-
-        try:
-            yield handle
-            latency_ms = int((time.time() - start_time) * 1000)
-            child_span.set_attribute('latency_ms', latency_ms)
-            child_span.set_status(Status(StatusCode.OK))
-            _registry_finish_step(parent_span, step_index, 'success', latency_ms,
-                                  output_summary=handle.output_summary)
-        except Exception as e:
-            latency_ms = int((time.time() - start_time) * 1000)
-            child_span.set_attribute('latency_ms', latency_ms)
-            child_span.set_status(Status(StatusCode.ERROR, str(e)))
-            child_span.set_attribute('error_type', type(e).__name__)
-            child_span.set_attribute('error_message', str(e))
-            _registry_finish_step(parent_span, step_index, 'failure', latency_ms, type(e).__name__,
-                                  output_summary=handle.output_summary)
-            raise
-        finally:
-            _pop_current_step()
 
 
 def trace_model_call(
@@ -774,6 +806,12 @@ def trace_model_call(
     """
     tracer = get_tracer()
     if tracer is None:
+        import logging as _mc_log
+        _mc_log.getLogger(__name__).warning(
+            "trace_model_call: tracer is None — model call for provider=%r model=%r will NOT be recorded. "
+            "Ensure initialize_tracer() was called at agent startup.",
+            provider, model_name,
+        )
         return
 
     # -----------------------------------------------------------------------
@@ -809,63 +847,81 @@ def trace_model_call(
         }
         with _token_registry_lock:
             _token_registry.setdefault(span_ctx.trace_id, []).append(call_entry)
-
-    # Also propagate key attributes onto the current span for distributed-tracing
+        import logging as _mc_log
+        _mc_log.getLogger(__name__).info(
+            "trace_model_call: recorded model call — provider=%r, model=%r, "
+            "prompt_tokens=%d, completion_tokens=%d, latency_ms=%d, status=%r, "
+            "trace_id=%x, step_index=%d",
+            provider, model_name,
+            int(prompt_tokens or 0), int(completion_tokens or 0), int(latency_ms or 0),
+            status,
+            span_ctx.trace_id,
+            call_entry['step_index'],
+        )
+    else:
+        import logging as _mc_log
+        _mc_log.getLogger(__name__).warning(
+            "trace_model_call: no active OTel trace context — "
+            "model call for provider=%r model=%r will NOT appear in DB "
+            "(call is outside a @trace_agent span)",
+            provider, model_name,
+        )
     # visibility (e.g. Jaeger).  Note: the current span may be a step span
     # rather than the agent span — the registry above is the authoritative path
     # for the database exporter.
     if current_span and current_span.is_recording():
-        # Set model_name on the current span (if not already set)
-        if not current_span.attributes or 'model_name' not in current_span.attributes:
-            current_span.set_attribute("model_name", model_name)
-        if not current_span.attributes or 'llm_provider' not in current_span.attributes:
-            current_span.set_attribute("llm_provider", provider)
-        current_span.set_attribute("prompt_tokens", prompt_tokens)
-        current_span.set_attribute("completion_tokens", completion_tokens)
-        current_span.set_attribute("total_tokens", prompt_tokens + completion_tokens)
-        current_span.set_attribute("llm_status", status)
-        current_span.set_attribute("parameter.token_usage_available", str(token_usage_available).lower())
-        current_span.set_attribute("parameter.token_usage_estimated", str(token_usage_estimated).lower())
-        if error is not None:
-            current_span.set_attribute("llm_error_type", type(error).__name__)
-            current_span.set_attribute("llm_error_message", str(error))
+        try:
+            # Set model_name on the current span (if not already set)
+            if not current_span.attributes or 'model_name' not in current_span.attributes:
+                current_span.set_attribute("model_name", model_name)
+            if not current_span.attributes or 'llm_provider' not in current_span.attributes:
+                current_span.set_attribute("llm_provider", provider)
+            current_span.set_attribute("prompt_tokens", prompt_tokens)
+            current_span.set_attribute("completion_tokens", completion_tokens)
+            current_span.set_attribute("llm_status", status)
+            current_span.set_attribute("parameter.token_usage_available", str(token_usage_available).lower())
+            current_span.set_attribute("parameter.token_usage_estimated", str(token_usage_estimated).lower())
+            if error is not None:
+                current_span.set_attribute("llm_error_type", type(error).__name__)
+                current_span.set_attribute("llm_error_message", str(error))
+        except Exception:
+            # Silently ignore if span has ended between is_recording check and set_attribute
+            pass
 
     # Create a span for the model call
     with tracer.start_as_current_span(f"llm/{provider}/{model_name}") as span:
-        span.set_attribute("provider", provider)
-        span.set_attribute("model_name", model_name)
-        span.set_attribute("operation", f"{provider}_call")
-        
-        if model_version:
-            span.set_attribute("model_version", model_version)
-        
-        # Set token usage
-        span.set_attribute("prompt_tokens", prompt_tokens)
-        span.set_attribute("completion_tokens", completion_tokens)
-        span.set_attribute("total_tokens", prompt_tokens + completion_tokens)
-        
-        # Set latency
-        span.set_attribute("latency_ms", latency_ms)
-        span.set_attribute("duration_ms", latency_ms)
-        
-        # Set parameters
-        if parameters:
-            for key, value in parameters.items():
-                if value is not None:
-                    span.set_attribute(f"parameter.{key}", str(value))
-        
-        # Set cache status
-        if cache_status:
-            span.set_attribute("cache_status", cache_status)
-        
-        # Set status
-        if status == 'success':
-            span.set_status(Status(StatusCode.OK))
-        else:
-            span.set_status(Status(StatusCode.ERROR))
-            if error:
-                span.set_attribute("error_type", type(error).__name__)
-                span.set_attribute("error_message", str(error))
+        if span and span.is_recording():
+            span.set_attribute("provider", provider)
+            span.set_attribute("model_name", model_name)
+            
+            if model_version:
+                span.set_attribute("model_version", model_version)
+            
+            # Set token usage
+            span.set_attribute("prompt_tokens", prompt_tokens)
+            span.set_attribute("completion_tokens", completion_tokens)
+            
+            # Set latency
+            span.set_attribute("latency_ms", latency_ms)
+            
+            # Set parameters
+            if parameters:
+                for key, value in parameters.items():
+                    if value is not None:
+                        span.set_attribute(f"parameter.{key}", str(value))
+            
+            # Set cache status
+            if cache_status:
+                span.set_attribute("cache_status", cache_status)
+            
+            # Set status
+            if status == 'success':
+                span.set_status(Status(StatusCode.OK))
+            else:
+                span.set_status(Status(StatusCode.ERROR))
+                if error:
+                    span.set_attribute("error_type", type(error).__name__)
+                    span.set_attribute("error_message", str(error))
 
 
 def trace_tool_call(
@@ -899,6 +955,13 @@ def trace_tool_call(
         error: Exception if failed
     """
     tracer = get_tracer()
+    if tracer is None:
+        import logging as _tc_log
+        _tc_log.getLogger(__name__).warning(
+            "trace_tool_call: tracer is None — tool call for tool=%r will NOT be recorded. "
+            "Ensure initialize_tracer() was called at agent startup.",
+            tool_name,
+        )
 
     # -----------------------------------------------------------------------
     # Accumulate this tool call in the trace-level tool registry.
@@ -936,6 +999,22 @@ def trace_tool_call(
         }
         with _tool_registry_lock:
             _tool_registry.setdefault(span_ctx.trace_id, []).append(call_entry)
+        import logging as _tc_log
+        _tc_log.getLogger(__name__).info(
+            "trace_tool_call: recorded tool call — tool=%r, latency_ms=%d, status=%r, "
+            "trace_id=%x, step_index=%d",
+            tool_name, int(latency_ms or 0), status,
+            span_ctx.trace_id,
+            call_entry['step_index'],
+        )
+    else:
+        import logging as _tc_log
+        _tc_log.getLogger(__name__).warning(
+            "trace_tool_call: no active OTel trace context — "
+            "tool call for tool=%r will NOT appear in DB "
+            "(call is outside a @trace_agent span)",
+            tool_name,
+        )
 
     if tracer is None:
         return
@@ -1000,7 +1079,7 @@ def _extract_user_query(args: tuple, kwargs: dict, func: Callable) -> Optional[s
         # File-based input (generic)
         'file', 'file_path', 'filepath', 'filename', 'msg_file',
         # Structured input objects (generic)
-        'data', 'payload', 'request', 'request_data',
+        'data', 'payload', 'request_data', 'user_input',
         # Domain-specific — extend as needed
         'email_data', 'email_json',
     }
@@ -1021,7 +1100,7 @@ def _extract_user_query(args: tuple, kwargs: dict, func: Callable) -> Optional[s
                 return _os.path.basename(value) or value
             return value
         if isinstance(value, dict):
-            for key in ['query', 'content', 'message', 'text', 'body', 'subject', 'title']:
+            for key in ['requirements', 'query', 'content', 'message', 'text', 'body', 'subject', 'title']:
                 if key in value and isinstance(value[key], str):
                     return f"{key.title()}: {value[key]}"
             try:
@@ -1052,21 +1131,25 @@ def _extract_user_query(args: tuple, kwargs: dict, func: Callable) -> Optional[s
     except Exception:
         pass
 
-    # --- 3. Final fallback: first non-session positional argument ---
+    # --- 3. Final fallback: first non-session, non-HTTP positional argument ---
     for arg in args:
         if arg is None:
             continue
-        if 'session' in type(arg).__name__.lower():
+        # Skip framework objects (Starlette Request, SQLAlchemy Session, etc.)
+        _type_name = type(arg).__name__.lower()
+        if 'session' in _type_name or 'request' in _type_name:
             continue
         if isinstance(arg, str):
             return arg
         if isinstance(arg, dict):
+            for key in ['requirements', 'query', 'content', 'message', 'text', 'body']:
+                if key in arg and isinstance(arg[key], str):
+                    return f"{key.title()}: {arg[key]}"
             try:
                 import json as _json
                 return _json.dumps(arg, default=str)
             except Exception:
                 return str(arg)
-        return str(arg)
 
     return None
 
@@ -1136,18 +1219,12 @@ def _extract_agent_response(result: Any) -> Optional[str]:
 
 
 def _get_environment() -> str:
-    """Get current environment from config or default."""
+    """Get current environment from config (.env file)."""
     try:
-        from observability.config import settings
-        # Try to infer from config
-        if hasattr(settings, 'ENVIRONMENT'):
-            return settings.ENVIRONMENT
-        # Otherwise infer from other settings
-        if hasattr(settings, 'USE_KEY_VAULT') and settings.USE_KEY_VAULT:
-            return "production"
-        return "development"
+        from config import settings
+        return settings.ENVIRONMENT
     except Exception:
-        return "unknown"
+        return "development"
 
 
 

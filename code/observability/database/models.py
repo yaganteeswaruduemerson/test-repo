@@ -1,9 +1,13 @@
 """
-SQLAlchemy ORM models for the observability database.
+SQLAlchemy ORM models for the observability database (Azure SQL Server).
 
 Contains all tables related to agent execution traces and evaluation records.
 These models use ObsBase (observability/database/base.py) so they are registered
 in a completely separate SQLAlchemy metadata from the main application database.
+
+Uses Azure SQL Server-specific types:
+  - UNIQUEIDENTIFIER for UUID columns
+  - JSON for JSONB columns
 """
 
 from enum import Enum
@@ -28,37 +32,22 @@ from uuid import uuid4
 from observability.database.base import ObsBase
 
 # ---------------------------------------------------------------------------
-# Database-agnostic type helpers
+# Azure SQL type mappings
 # ---------------------------------------------------------------------------
 
-def _get_db_type() -> str:
-    try:
-        from observability.config import settings
-        return settings.OBS_DATABASE_TYPE.lower()
-    except Exception:
-        return "sqlite"
+from sqlalchemy.dialects.mssql import UNIQUEIDENTIFIER
 
-
-_db_type = _get_db_type()
-
-if _db_type == "postgresql":
-    from sqlalchemy.dialects.postgresql import UUID as PostgresUUID, JSONB
-    _UUIDType = PostgresUUID(as_uuid=True)
-    _JSONBType = JSONB
-elif _db_type in ("azure_sql", "mssql"):
-    from sqlalchemy.dialects.mssql import UNIQUEIDENTIFIER
-    _UUIDType = UNIQUEIDENTIFIER
-    _JSONBType = JSON
-else:
-    _UUIDType = String(36)
-    _JSONBType = JSON
+_UUIDType = UNIQUEIDENTIFIER
+_JSONBType = JSON
 
 
 def get_uuid_type():
+    """Return UUID type for Azure SQL Server."""
     return _UUIDType
 
 
 def get_jsonb_type():
+    """Return JSON type for Azure SQL Server."""
     return _JSONBType
 
 
@@ -94,13 +83,13 @@ class ObservabilityTrace(ObsBase):
     # ── Agent metadata ─────────────────────────────────────────────────────
     agent_name    = Column(String(255), nullable=False, index=True)
     agent_version = Column(String(100), nullable=True)
+    project_name  = Column(String(255), nullable=True, index=True)
     environment   = Column(String(100), nullable=True, index=True)
 
     # ── Timing ────────────────────────────────────────────────────────────
     started_at       = Column(DateTime(timezone=True), nullable=False, index=True)
     ended_at         = Column(DateTime(timezone=True), nullable=True)
     total_latency_ms = Column(BigInteger, nullable=True)
-    queue_time_ms    = Column(BigInteger, nullable=True)
 
     # ── Status & error ────────────────────────────────────────────────────
     status              = Column(SQLEnum(ObservabilityExecutionStatus), nullable=False, index=True)

@@ -1,0 +1,7 @@
+{
+  "requirements": "string",
+  "language": "string",
+  "framework": "string",
+  "dependencies": "list",
+  "acceptance_criteria": "string"
+}
